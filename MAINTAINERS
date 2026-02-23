@@ -1,0 +1,89 @@
+Code in Motion (CiM) Maintainers
+==================================
+
+This file provides information about the maintainers of the Code in Motion
+project. Maintainers are responsible for reviewing patches, managing releases,
+and ensuring the project's overall health and direction.
+
+Patch Submission
+----------------
+All patches should follow the guidelines in CONTRIBUTING.md and must include
+a Signed-off-by line as per the Developer Certificate of Origin (DCO).
+
+See also:
+- CONTRIBUTING.md for detailed contribution guidelines
+- DCO for the Developer Certificate of Origin
+- CODE_OF_CONDUCT.md for community standards
+
+Maintainer Responsibilities
+---------------------------
+Maintainers are expected to:
+- Review and merge pull requests in a timely manner
+- Maintain code quality and project standards
+- Respond to issues and community questions
+- Coordinate releases and version management
+- Ensure security issues are addressed promptly
+- Guide the technical direction of the project
+
+How to Become a Maintainer
+--------------------------
+Contributors who demonstrate sustained commitment to the project through
+high-quality contributions, code reviews, and community engagement may be
+invited to become maintainers.
+
+Format
+------
+The following format is used for each maintainer entry:
+
+M: Maintainer name <email@address>
+R: Designated reviewer (optional)
+L: Mailing list (if applicable)
+S: Status (Supported, Maintained, Odd Fixes, Orphan, Obsolete)
+F: File or directory pattern
+
+Status meanings:
+    Supported:     Someone is actually paid to look after this
+    Maintained:    Someone actually looks after it
+    Odd Fixes:     It has a maintainer but they don't have time to do
+                   much other than throw the odd patch in
+    Orphan:        No current maintainer, needs a new one
+    Obsolete:      Old code, should be replaced or removed
+
+Maintainers List
+================
+
+CIM - CODE IN MOTION (ALL COMPONENTS)
+M:	Joakim Bech <Joakim.Bech@analog.com>
+S:	Maintained
+F:	*
+
+CLI TOOL (dsdk-cli)
+M:	Joakim Bech <Joakim.Bech@analog.com>
+S:	Maintained
+F:	dsdk-cli/
+
+GUI (dsdk-gui)
+M:	Joakim Bech <Joakim.Bech@analog.com>
+S:	Maintained
+F:	dsdk-gui/
+
+VSCODE EXTENSION (dsdk-vscode)
+M:	Joakim Bech <Joakim.Bech@analog.com>
+S:	Maintained
+F:	dsdk-vscode/
+
+BUILD SCRIPTS AND TOOLING
+M:	Joakim Bech <Joakim.Bech@analog.com>
+S:	Maintained
+F:	cross-compile.sh
+F:	Cross.toml
+F:	Makefile
+F:	scripts/
+
+DOCUMENTATION
+M:	Joakim Bech <Joakim.Bech@analog.com>
+S:	Maintained
+F:	README.md
+F:	CONTRIBUTING.md
+F:	CODE_OF_CONDUCT.md
+F:	SECURITY.md

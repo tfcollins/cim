@@ -1,0 +1,194 @@
+{
+  "name": "cim",
+  "displayName": "Code in Motion",
+  "description": "VS Code extension for integrating with Code in Motion Makefile tasks",
+  "version": "0.1.0",
+  "publisher": "analogdevicesinc",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "sdk",
+    "makefile",
+    "build",
+    "tasks",
+    "workflow"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/analogdevicesinc/cim"
+  },
+  "activationEvents": [
+    "workspaceContains:.workspace",
+    "workspaceContains:.vscode/tasks.json"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "id": "cim.tasksView",
+          "name": "SDK Tasks"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "cim.tasksView",
+        "contents": "No Code in Motion workspace detected.\n[Learn more](https://github.com/analogdevicesinc/cim)\nTo use Code in Motion, initialize a workspace in your project.",
+        "when": "!workspaceContains:.workspace",
+        "icon": "$(info)"
+      }
+    ],
+    "commands": [
+      {
+        "command": "cim.refreshTasks",
+        "title": "Refresh SDK Tasks",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cim.runTask",
+        "title": "Run SDK Task",
+        "icon": "$(play)"
+      },
+      {
+        "command": "cim.runBuild",
+        "title": "SDK: Build",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "cim.runTest",
+        "title": "SDK: Test", 
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "cim.runClean",
+        "title": "SDK: Clean",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "cim.runFlash",
+        "title": "SDK: Flash",
+        "icon": "$(zap)"
+      },
+      {
+        "command": "cim.runEnvsetup",
+        "title": "SDK: Environment Setup",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "cim.createSdkTerminal",
+        "title": "SDK: Open Terminal",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "cim.editTasks",
+        "title": "Edit Task Configuration",
+        "icon": "$(edit)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "cim.refreshTasks",
+          "when": "view == cim.tasksView",
+          "group": "navigation"
+        },
+        {
+          "command": "cim.runBuild",
+          "when": "view == cim.tasksView",
+          "group": "inline@1"
+        },
+        {
+          "command": "cim.runTest", 
+          "when": "view == cim.tasksView",
+          "group": "inline@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "cim.runTask",
+          "when": "view == cim.tasksView && viewItem == sdkTask",
+          "group": "inline"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "cim.runTask",
+          "when": "workspaceContains:.workspace"
+        },
+        {
+          "command": "cim.runBuild",
+          "when": "workspaceContains:.workspace"
+        },
+        {
+          "command": "cim.runTest",
+          "when": "workspaceContains:.workspace"
+        },
+        {
+          "command": "cim.runClean",
+          "when": "workspaceContains:.workspace"
+        },
+        {
+          "command": "cim.runFlash",
+          "when": "workspaceContains:.workspace"
+        },
+        {
+          "command": "cim.runEnvsetup",
+          "when": "workspaceContains:.workspace"
+        },
+        {
+          "command": "cim.editTasks",
+          "when": "workspaceContains:.workspace"
+        },
+        {
+          "command": "cim.createSdkTerminal",
+          "when": "workspaceContains:.workspace"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "cim.runBuild",
+          "when": "workspaceContains:.workspace",
+          "group": "navigation"
+        }
+      ]
+    },
+    "taskDefinitions": [
+      {
+        "type": "sdk",
+        "required": [
+          "target"
+        ],
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "The SDK target (e.g., sdk-test, sdk-build, sdk-clean, sdk-flash)"
+          },
+          "presentation": {
+            "type": "object",
+            "description": "Task presentation settings"
+          }
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run esbuild-base -- --minify",
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --platform=node --target=node16",
+    "esbuild": "npm run esbuild-base -- --sourcemap",
+    "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "esbuild": "^0.25.0",
+    "@vscode/test-electron": "^2.4.1"
+  }
+}

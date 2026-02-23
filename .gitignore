@@ -1,0 +1,27 @@
+# Generated files
+**/target/
+config.yml
+os-dependencies.yml
+python-dependencies.yml
+sdk.yml
+
+# Workspace-generated Makefile (but allow root dev Makefile)
+/**/Makefile
+!/Makefile
+
+# Python virtual environment
+.venv/
+scripts/.venv/
+
+# IDE files
+.idea/
+.vscode/
+.vs/
+*.swp
+*.swo
+AGENTS.md
+
+# OS files
+.DS_Store
+Thumbs.db
+Dockerfile
