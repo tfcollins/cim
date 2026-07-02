@@ -249,7 +249,7 @@ pub fn create_complex_sdk_config() -> SdkConfig {
 /// Write an SDK config to a YAML file
 #[allow(dead_code)]
 pub fn write_sdk_config(config: &SdkConfig, path: &Path) {
-    let yaml = serde_yaml::to_string(config).expect("Failed to serialize SDK config");
+    let yaml = noyalib::to_string(config).expect("Failed to serialize SDK config");
     fs::write(path, yaml).expect("Failed to write SDK config file");
 }
 

@@ -582,22 +582,20 @@ fn deserialize_os_dependencies<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
+    use noyalib::Value;
     use serde::de::{Deserialize, Error};
-    use serde_yaml::Value;
 
     let value = Value::deserialize(deserializer)?;
     let mut result = HashMap::new();
 
     if let Value::Mapping(map) = value {
         for (key, val) in map {
-            if let Value::String(key_str) = key {
-                // Try to deserialize as OsConfig
-                // If it fails (e.g., it's a sequence for an anchor definition), skip it
-                if let Ok(os_config) = OsConfig::deserialize(val) {
-                    result.insert(key_str, os_config);
-                }
-                // Silently skip entries that aren't OsConfig (like anchor definitions)
+            // Try to deserialize as OsConfig
+            // If it fails (e.g., it's a sequence for an anchor definition), skip it
+            if let Ok(os_config) = OsConfig::deserialize(&val) {
+                result.insert(key, os_config);
             }
+            // Silently skip entries that aren't OsConfig (like anchor definitions)
         }
     } else {
         return Err(D::Error::custom("Expected a mapping"));
@@ -811,16 +809,16 @@ impl SdkConfigCore for SdkConfig {
     }
 }
 
-/// Try to produce a more specific error message when `serde_yaml` fails to parse an `SdkConfig`.
+/// Try to produce a more specific error message when `noyalib` fails to parse an `SdkConfig`.
 ///
 /// Re-parses the YAML as a raw `Value` and checks known sections for unrecognized fields,
 /// falling back to the original error when no specific cause can be identified.
 fn enhance_config_error(
     yaml_content: &str,
     path: &Path,
-    original_error: &serde_yaml::Error,
+    original_error: &noyalib::Error,
 ) -> String {
-    let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(yaml_content) else {
+    let Ok(raw) = noyalib::from_str::<noyalib::Value>(yaml_content) else {
         return format!(
             "Config validation error in {}: {}",
             path.display(),
@@ -829,14 +827,13 @@ fn enhance_config_error(
     };
 
     let sections = ["build", "envsetup", "test", "clean", "flash"];
-    if let serde_yaml::Value::Mapping(ref map) = raw {
+    if let noyalib::Value::Mapping(ref map) = raw {
         for &section in &sections {
-            let key = serde_yaml::Value::String(section.to_string());
-            if let Some(serde_yaml::Value::Mapping(ref sec_map)) = map.get(&key) {
+            if let Some(noyalib::Value::Mapping(ref sec_map)) = map.get(section) {
                 let known = ["commands", "depends_on"];
                 let unknown: Vec<&str> = sec_map
                     .keys()
-                    .filter_map(|k| k.as_str())
+                    .map(|k| k.as_str())
                     .filter(|k| !known.contains(k))
                     .collect();
                 if !unknown.is_empty() {
@@ -884,7 +881,7 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<SdkConfig, Box<dyn std::er
     let file_content = fs::read_to_string(&path_buf)
         .map_err(|e| format!("Cannot read config file {}: {}", path_buf.display(), e))?;
 
-    let config: SdkConfig = serde_yaml::from_str(&file_content)
+    let config: SdkConfig = noyalib::from_str(&file_content)
         .map_err(|e| enhance_config_error(&file_content, &path_buf, &e))?;
 
     Ok(config)
@@ -902,7 +899,7 @@ pub fn load_os_dependencies<P: AsRef<Path>>(
     path: P,
 ) -> Result<OsDependencies, Box<dyn std::error::Error>> {
     let file_content = fs::read_to_string(path)?;
-    let os_deps: OsDependencies = serde_yaml::from_str(&file_content)?;
+    let os_deps: OsDependencies = noyalib::from_str(&file_content)?;
     Ok(os_deps)
 }
 
@@ -918,7 +915,7 @@ pub fn load_python_dependencies<P: AsRef<Path>>(
     path: P,
 ) -> Result<PythonDependencies, Box<dyn std::error::Error>> {
     let file_content = fs::read_to_string(path)?;
-    let python_deps: PythonDependencies = serde_yaml::from_str(&file_content)?;
+    let python_deps: PythonDependencies = noyalib::from_str(&file_content)?;
     Ok(python_deps)
 }
 
@@ -1741,7 +1738,7 @@ gits:
     url: https://github.com/example/repo1.git
     commit: main
     build: *shared_build
-  
+
   - name: repo2
     url: https://github.com/example/repo2.git
     commit: main

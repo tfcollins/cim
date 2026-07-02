@@ -441,7 +441,7 @@ pub(crate) fn handle_update_command(
         let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
         if marker_path.exists() {
             match fs::read_to_string(&marker_path) {
-                Ok(content) => serde_yaml::from_str::<WorkspaceMarker>(&content)
+                Ok(content) => noyalib::from_str::<WorkspaceMarker>(&content)
                     .ok()
                     .and_then(|m| m.match_pattern),
                 Err(_) => None,
@@ -482,7 +482,7 @@ pub(crate) fn handle_update_command(
     let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
     let workspace_no_mirror = if marker_path.exists() {
         match fs::read_to_string(&marker_path) {
-            Ok(content) => serde_yaml::from_str::<WorkspaceMarker>(&content)
+            Ok(content) => noyalib::from_str::<WorkspaceMarker>(&content)
                 .ok()
                 .and_then(|m| m.no_mirror)
                 .unwrap_or(false),

@@ -270,7 +270,7 @@ profiles:
   minimal:
     packages:
       - pyyaml
-  
+
   dev:
     packages:
       - pytest
@@ -348,7 +348,7 @@ gits:
     url: https://github.com/example/repo1.git
     commit: main
     build: *standard_build
-  
+
   - name: repo2
     url: https://github.com/example/repo2.git
     commit: main
@@ -852,7 +852,7 @@ linux-x86_64:
 "#;
 
     let os_deps: OsDependencies =
-        serde_yaml::from_str(yaml_content).expect("Should parse new format with multiple versions");
+        noyalib::from_str(yaml_content).expect("Should parse new format with multiple versions");
 
     let os_config = os_deps
         .os_configs
@@ -892,7 +892,7 @@ linux:
       - git
 "#;
 
-    let os_deps: OsDependencies = serde_yaml::from_str(yaml_content)
+    let os_deps: OsDependencies = noyalib::from_str(yaml_content)
         .expect("Should parse legacy format for backward compatibility");
 
     let os_config = os_deps
@@ -938,7 +938,7 @@ linux-x86_64:
 "#;
 
     let os_deps: OsDependencies =
-        serde_yaml::from_str(yaml_content).expect("Should parse mixed format");
+        noyalib::from_str(yaml_content).expect("Should parse mixed format");
 
     let os_config = os_deps
         .os_configs
@@ -974,7 +974,7 @@ linux-x86_64:
 "#;
 
     let os_deps: OsDependencies =
-        serde_yaml::from_str(yaml_content).expect("Should parse distro names with dashes");
+        noyalib::from_str(yaml_content).expect("Should parse distro names with dashes");
 
     let os_config = os_deps
         .os_configs
@@ -1010,7 +1010,7 @@ linux-x86_64:
 "#;
 
     let os_deps: OsDependencies =
-        serde_yaml::from_str(yaml_content).expect("Should parse flat packages list");
+        noyalib::from_str(yaml_content).expect("Should parse flat packages list");
 
     let distro = &os_deps.os_configs["linux-x86_64"].distros["ubuntu-24.04"];
     let packages = distro.package_manager.resolved_packages();
@@ -1037,7 +1037,7 @@ linux-x86_64:
 "#;
 
     let os_deps: OsDependencies =
-        serde_yaml::from_str(yaml_content).expect("Should parse nested (composed) packages list");
+        noyalib::from_str(yaml_content).expect("Should parse nested (composed) packages list");
 
     let distro = &os_deps.os_configs["linux-x86_64"].distros["ubuntu-24.04"];
     let packages = distro.package_manager.resolved_packages();
@@ -1065,7 +1065,7 @@ linux-x86_64:
 "#;
 
     let os_deps: OsDependencies =
-        serde_yaml::from_str(yaml_content).expect("Should parse nested packages with duplicates");
+        noyalib::from_str(yaml_content).expect("Should parse nested packages with duplicates");
 
     let distro = &os_deps.os_configs["linux-x86_64"].distros["ubuntu-24.04"];
     let packages = distro.package_manager.resolved_packages();
@@ -1098,7 +1098,7 @@ linux-aarch64:
 "#;
 
     let os_deps: OsDependencies =
-        serde_yaml::from_str(yaml_content).expect("Should parse file with mixed flat and nested");
+        noyalib::from_str(yaml_content).expect("Should parse file with mixed flat and nested");
 
     let x86_distro = &os_deps.os_configs["linux-x86_64"].distros["ubuntu-24.04"];
     let x86_pkgs = x86_distro.package_manager.resolved_packages();

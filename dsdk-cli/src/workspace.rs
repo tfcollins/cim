@@ -218,7 +218,7 @@ pub fn create_workspace_marker(
         match_pattern: params.match_pattern.map(|s| s.to_string()),
     };
 
-    fs::write(&marker_path, serde_yaml::to_string(&marker)?)?;
+    fs::write(&marker_path, noyalib::to_string(&marker)?)?;
     messages::verbose(&format!(
         "Created workspace marker: {}",
         marker_path.display()
@@ -234,9 +234,9 @@ pub fn update_workspace_marker_match_pattern(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
     let content = fs::read_to_string(&marker_path)?;
-    let mut marker: WorkspaceMarker = serde_yaml::from_str(&content)?;
+    let mut marker: WorkspaceMarker = noyalib::from_str(&content)?;
     marker.match_pattern = match_pattern.map(|s| s.to_string());
-    fs::write(&marker_path, serde_yaml::to_string(&marker)?)?;
+    fs::write(&marker_path, noyalib::to_string(&marker)?)?;
     Ok(())
 }
 
@@ -400,7 +400,7 @@ pub fn resolve_config_source_dir_from_marker(
         Err(_) => return (workspace_path.to_path_buf(), None),
     };
 
-    let marker = match serde_yaml::from_str::<WorkspaceMarker>(&content) {
+    let marker = match noyalib::from_str::<WorkspaceMarker>(&content) {
         Ok(m) => m,
         Err(_) => return (workspace_path.to_path_buf(), None),
     };
@@ -1183,9 +1183,9 @@ mod tests {
             match_pattern: None,
         };
 
-        let serialized = serde_yaml::to_string(&marker).expect("Failed to serialize marker");
+        let serialized = noyalib::to_string(&marker).expect("Failed to serialize marker");
         let deserialized: WorkspaceMarker =
-            serde_yaml::from_str(&serialized).expect("Failed to deserialize marker");
+            noyalib::from_str(&serialized).expect("Failed to deserialize marker");
 
         assert_eq!(marker.workspace_version, deserialized.workspace_version);
         assert_eq!(marker.created_at, deserialized.created_at);
@@ -1232,7 +1232,7 @@ mod tests {
 
         let marker_content = fs::read_to_string(&marker_path).expect("Failed to read marker");
         let marker: WorkspaceMarker =
-            serde_yaml::from_str(&marker_content).expect("Failed to parse marker");
+            noyalib::from_str(&marker_content).expect("Failed to parse marker");
 
         assert_eq!(marker.workspace_version, "1");
         assert_eq!(marker.config_file, config_name);

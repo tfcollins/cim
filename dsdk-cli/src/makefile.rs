@@ -2622,7 +2622,7 @@ mod tests {
     fn test_makefile_include_deserialization_legacy() {
         // The bare-list YAML form must deserialise into the Legacy variant.
         let yaml = "mirror: /tmp/mirror\ngits: []\nmakefile_include:\n  - include extra.mk\n";
-        let config: config::SdkConfig = serde_yaml::from_str(yaml).expect("parse yaml");
+        let config: config::SdkConfig = noyalib::from_str(yaml).expect("parse yaml");
         match config
             .makefile_include
             .as_ref()
@@ -2641,7 +2641,7 @@ mod tests {
     fn test_makefile_include_deserialization_structured() {
         // The structured YAML form must deserialise into the Structured variant.
         let yaml = "mirror: /tmp/mirror\ngits: []\nmakefile_include:\n  files:\n    - include extra.mk\n  exclude:\n    - qemu\n    - trusted-services\n";
-        let config: config::SdkConfig = serde_yaml::from_str(yaml).expect("parse yaml");
+        let config: config::SdkConfig = noyalib::from_str(yaml).expect("parse yaml");
         match config
             .makefile_include
             .as_ref()
@@ -2664,7 +2664,7 @@ mod tests {
     fn test_makefile_include_deserialization_exclude_only() {
         // Structured form with only exclude (no files) must deserialise correctly.
         let yaml = "mirror: /tmp/mirror\ngits: []\nmakefile_include:\n  exclude:\n    - qemu\n";
-        let config: config::SdkConfig = serde_yaml::from_str(yaml).expect("parse yaml");
+        let config: config::SdkConfig = noyalib::from_str(yaml).expect("parse yaml");
         match config
             .makefile_include
             .as_ref()
