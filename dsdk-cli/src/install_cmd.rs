@@ -105,7 +105,7 @@ pub(crate) fn handle_install_command(install_command: &InstallCommand) {
                     *symlink,
                     profile.as_deref(),
                     &workspace_path,
-                    &resolve_mirror(None, sdk_config.mirror.as_deref()),
+                    &resolve_mirror(None),
                 ) {
                     messages::error(&format!("Failed to install Python packages: {}", e));
                     std::process::exit(1);
@@ -129,7 +129,7 @@ pub(crate) fn handle_install_command(install_command: &InstallCommand) {
             // Create toolchain manager and install toolchains
             let toolchain_manager = toolchain_manager::ToolchainManager::new(
                 workspace_path.clone(),
-                resolve_mirror(None, sdk_config.mirror.as_deref()),
+                resolve_mirror(None),
             );
 
             if let Err(e) = toolchain_manager.install_toolchains(

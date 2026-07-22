@@ -424,13 +424,12 @@ gits:
 }
 
 #[test]
-fn test_manifest_mirror_key_is_parsed_but_deprecated() {
+fn test_legacy_manifest_mirror_key_is_ignored_but_loads() {
     let fixture = TestFixture::new();
     let config_path = fixture.path().join("sdk.yml");
 
-    // A manifest carrying the deprecated `mirror:` key loads and the value is
-    // parsed into the field (honored for backward compatibility, below
-    // --mirror and the user config in precedence).
+    // A manifest carrying the legacy `mirror:` key still loads; the key is
+    // simply ignored (mirror is configured via --mirror or the user config).
     let yaml_content = r#"mirror: /tmp/mirror
 gits:
   - name: test
@@ -443,10 +442,6 @@ gits:
     let loaded = load_config(&config_path).expect("Should load config");
     assert_eq!(loaded.gits.len(), 1);
     assert_eq!(loaded.gits[0].name, "test");
-    assert_eq!(
-        loaded.mirror.as_deref(),
-        Some(std::path::Path::new("/tmp/mirror"))
-    );
 }
 
 #[test]
@@ -1123,7 +1118,7 @@ fn test_resolve_mirror_cli_override_wins() {
 
     // The --mirror CLI override takes precedence over user config and the
     // built-in default, regardless of any manifest contents.
-    let resolved = resolve_mirror(Some(Path::new("/explicit/cli/mirror")), None);
+    let resolved = resolve_mirror(Some(Path::new("/explicit/cli/mirror")));
     assert_eq!(resolved, PathBuf::from("/explicit/cli/mirror"));
 }
 

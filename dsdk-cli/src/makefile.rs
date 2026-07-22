@@ -791,7 +791,6 @@ mod tests {
     #[test]
     fn test_generate_makefile_content_empty() {
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -832,7 +831,6 @@ mod tests {
         };
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![git_config],
@@ -882,7 +880,6 @@ mod tests {
         };
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![git1, git2],
@@ -973,7 +970,6 @@ mod tests {
         };
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![git_config],
@@ -1018,7 +1014,6 @@ mod tests {
     fn test_envsetup_target_generation() {
         // Test with envsetup commands
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1054,7 +1049,6 @@ mod tests {
     #[test]
     fn test_envsetup_target_with_comments_and_echo() {
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1095,7 +1089,6 @@ mod tests {
     fn test_envsetup_target_empty_commands() {
         // Test with empty envsetup commands
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1122,7 +1115,6 @@ mod tests {
     fn test_envsetup_target_none() {
         // Test with no envsetup commands
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1171,7 +1163,6 @@ mod tests {
     fn test_test_target_generation() {
         // Test with test commands
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1210,7 +1201,6 @@ mod tests {
     #[test]
     fn test_test_target_with_comments_and_echo() {
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1251,7 +1241,6 @@ mod tests {
     fn test_test_target_empty_commands() {
         // Test with empty test commands
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1278,7 +1267,6 @@ mod tests {
     fn test_test_target_none() {
         // Test with no test commands
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1327,7 +1315,6 @@ mod tests {
     fn test_combined_envsetup_and_test_targets() {
         // Test with both envsetup and test commands
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1411,7 +1398,6 @@ mod tests {
         );
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1457,7 +1443,6 @@ mod tests {
         vars.insert("DERIVED".to_string(), "${{ BASE }}/extras".to_string());
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1492,7 +1477,6 @@ mod tests {
     fn test_makefile_include_with_workspace_reference() {
         // ${{ WORKSPACE }} in makefile_include paths must become $(WORKSPACE).
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1541,7 +1525,6 @@ mod tests {
         );
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: Some(vec![config::InstallConfig {
                 name: "devcontainer".to_string(),
@@ -1607,7 +1590,6 @@ mod tests {
         vars.insert("PLATFORMS_ROOT".to_string(), "platforms".to_string());
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![],
@@ -1654,7 +1636,6 @@ mod tests {
         vars.insert("MY_VAR".to_string(), "value".to_string());
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: Some(vec![config::InstallConfig {
                 name: "my-tool".to_string(),
@@ -1731,7 +1712,6 @@ mod tests {
         vars.insert("MY_VAR".to_string(), "value".to_string());
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: Some(vec![config::InstallConfig {
                 name: "my-tool".to_string(),
@@ -1893,7 +1873,6 @@ mod tests {
         .expect("write u-boot.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -1933,7 +1912,6 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -1976,7 +1954,6 @@ mod tests {
         std::fs::write(build_dir.join("u-boot.mk"), "").expect("write u-boot.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -2028,7 +2005,6 @@ mod tests {
         std::fs::write(build_dir.join("linux.mk"), "").expect("write linux.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -2082,7 +2058,6 @@ mod tests {
         );
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -2137,7 +2112,6 @@ mod tests {
             .expect("write u-boot.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -2188,7 +2162,6 @@ mod tests {
         std::fs::write(build_dir.join("u-boot.mk"), "").expect("write u-boot.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -2269,7 +2242,6 @@ mod tests {
         let abs_path = abs_dir.to_str().unwrap().to_string();
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -2319,7 +2291,6 @@ mod tests {
         std::fs::write(fragments_dir.join("u-boot.mk"), "").expect("write u-boot.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -2399,7 +2370,6 @@ mod tests {
             .expect("write trusted-services.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![
@@ -2468,7 +2438,6 @@ mod tests {
             .expect("write trusted-services.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![
@@ -2536,7 +2505,6 @@ mod tests {
             .expect("write trusted-services.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![
@@ -2607,7 +2575,6 @@ mod tests {
         std::fs::write(build_dir.join("u-boot.mk"), "").expect("write u-boot.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -2716,7 +2683,6 @@ mod tests {
     #[test]
     fn test_generate_makefile_with_auto_dir_vars() {
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![
@@ -2781,7 +2747,6 @@ mod tests {
         );
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -2827,7 +2792,6 @@ mod tests {
         );
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -2870,7 +2834,6 @@ mod tests {
     #[test]
     fn test_generate_makefile_dir_var_uses_immediate_assignment() {
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -3038,7 +3001,6 @@ mod tests {
         .expect("write u-boot.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -3089,7 +3051,6 @@ mod tests {
         .expect("write linux.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -3138,7 +3099,6 @@ mod tests {
             .expect("write zephyr.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -3198,7 +3158,6 @@ mod tests {
         .expect("write linux.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![
@@ -3262,7 +3221,6 @@ mod tests {
         .expect("write u-boot.mk");
 
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
@@ -3317,7 +3275,6 @@ mod tests {
 
         // Custom phases are *added* to the five standard ones
         let config = config::SdkConfig {
-            mirror: None,
             toolchains: None,
             install: None,
             gits: vec![config::GitConfig {
