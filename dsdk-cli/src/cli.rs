@@ -47,6 +47,9 @@ pub enum Commands {
             help = "Show available versions for this target"
         )]
         target: Option<String>,
+        /// Show detailed output (credential attempts, git operations)
+        #[arg(long)]
+        verbose: bool,
     },
     /// Initialize a new workspace from a configuration file
     Init {
@@ -85,12 +88,33 @@ pub enum Commands {
         /// Skip mirror operations and clone directly from remote URLs
         #[arg(long, help = "Skip mirror, clone directly from remote repos")]
         no_mirror: bool,
+        /// Override the mirror cache directory for this invocation
+        #[arg(
+            long,
+            value_name = "DIR",
+            help = "Mirror cache directory (overrides config file and default)"
+        )]
+        mirror: Option<PathBuf>,
         /// Force initialization by removing existing workspace directory
         #[arg(long, help = "Force workspace creation (removes existing")]
         force: bool,
         /// Only initialize repositories matching the given regex pattern
         #[arg(long, help = "Only clone repositories matching this regex pattern")]
         r#match: Option<String>,
+        /// Only initialize repositories belonging to the given group(s)
+        #[arg(
+            long,
+            value_name = "NAMES",
+            help = "Only clone repositories in these comma-separated group(s)"
+        )]
+        include_group: Option<String>,
+        /// Exclude repositories belonging to the given group(s)
+        #[arg(
+            long,
+            value_name = "NAMES",
+            help = "Exclude repositories in these comma-separated group(s)"
+        )]
+        exclude_group: Option<String>,
         /// Enable verbose output
         #[arg(long, help = "Show detailed progress information")]
         verbose: bool,
@@ -131,9 +155,36 @@ pub enum Commands {
         /// Skip mirror operations and clone directly from remote URLs
         #[arg(long, help = "Skip mirror, only update workspace from remote URLs")]
         no_mirror: bool,
+        /// Override the mirror cache directory for this invocation
+        #[arg(
+            long,
+            value_name = "DIR",
+            help = "Mirror cache directory (overrides config file and default)"
+        )]
+        mirror: Option<PathBuf>,
         /// Only update repositories matching the given regex pattern
         #[arg(long, help = "Only update repositories matching this regex pattern")]
         r#match: Option<String>,
+        /// Only update repositories belonging to the given group(s)
+        #[arg(
+            long,
+            value_name = "NAMES",
+            help = "Only update repositories in these comma-separated group(s)"
+        )]
+        include_group: Option<String>,
+        /// Exclude repositories belonging to the given group(s)
+        #[arg(
+            long,
+            value_name = "NAMES",
+            help = "Exclude repositories in these comma-separated group(s)"
+        )]
+        exclude_group: Option<String>,
+        /// Update all repositories, ignoring the stored match pattern
+        #[arg(
+            long,
+            help = "Update all repositories, ignoring stored match filter from init"
+        )]
+        all: bool,
         /// Enable verbose output
         #[arg(short, long, help = "Show detailed progress information")]
         verbose: bool,
@@ -152,12 +203,40 @@ pub enum Commands {
         /// Only execute command in repositories matching the given regex pattern
         #[arg(long, help = "Only run command in repositories matching this regex")]
         r#match: Option<String>,
+        /// Only execute command in repositories belonging to the given group(s)
+        #[arg(
+            long,
+            value_name = "NAMES",
+            help = "Only run command in repositories in these comma-separated group(s)"
+        )]
+        include_group: Option<String>,
+        /// Exclude repositories belonging to the given group(s)
+        #[arg(
+            long,
+            value_name = "NAMES",
+            help = "Exclude repositories in these comma-separated group(s)"
+        )]
+        exclude_group: Option<String>,
     },
     /// Generate a Makefile from configuration
     Makefile {
         /// Skip section dividers in the generated Makefile
         #[arg(long, help = "Do not add section dividers to the generated Makefile")]
         no_dividers: bool,
+        /// Only include repositories belonging to the given group(s)
+        #[arg(
+            long,
+            value_name = "NAMES",
+            help = "Only include repositories in these comma-separated group(s)"
+        )]
+        include_group: Option<String>,
+        /// Exclude repositories belonging to the given group(s)
+        #[arg(
+            long,
+            value_name = "NAMES",
+            help = "Exclude repositories in these comma-separated group(s)"
+        )]
+        exclude_group: Option<String>,
     },
     /// Add a new git repository to configuration
     Add {
@@ -310,7 +389,7 @@ pub enum DocsCommand {
 pub enum DockerCommand {
     /// Create a Dockerfile for SDK development
     Create {
-        /// Target name (looks in configs/targets/<name>/sdk.yml)
+        /// Target name (looks in targets/<name>/sdk.yml)
         #[arg(
             short,
             long,
@@ -334,25 +413,13 @@ pub enum DockerCommand {
             help = "Target version (branch/tag name)"
         )]
         version: Option<String>,
-        /// Target Linux distribution (e.g., ubuntu:22.04, fedora:42)
-        #[arg(short, long, help = "Linux distribution for Docker image")]
+        /// Base Docker image (e.g. ubuntu:22.04, fedora:40) [default: ubuntu:22.04]
+        #[arg(
+            short,
+            long,
+            help = "Linux distribution for Docker image (e.g. ubuntu:22.04)"
+        )]
         distro: Option<String>,
-        /// Python dependency profile to use
-        #[arg(
-            short,
-            long,
-            default_value = "docs",
-            help = "Python profile from python-dependencies.yml"
-        )]
-        profile: String,
-        /// Target architecture for cross-compilation
-        #[arg(
-            short,
-            long,
-            default_value = "aarch64-unknown-linux-gnu",
-            help = "Target architecture"
-        )]
-        arch: String,
         /// Output Dockerfile path
         #[arg(
             short,
@@ -362,20 +429,8 @@ pub enum DockerCommand {
         )]
         output: PathBuf,
         /// Force overwrite existing Dockerfile
-        #[arg(short, long, help = "Force overwrite existing files")]
+        #[arg(short, long, help = "Force overwrite existing Dockerfile")]
         force: bool,
-        /// Force all git URLs to use HTTPS protocol for corporate proxy compatibility
-        #[arg(long, help = "Convert git URLs to HTTPS")]
-        force_https: bool,
-        /// Force all git URLs to use SSH protocol for key-based authentication
-        #[arg(long, help = "Convert git URLs to SSH")]
-        force_ssh: bool,
-        /// Skip mirror operations in the generated Docker environment
-        #[arg(long, help = "Skip mirror operations in Docker")]
-        no_mirror: bool,
-        /// Only include repositories matching this regex pattern in the Dockerfile
-        #[arg(short, long, help = "Filter repositories by regex pattern")]
-        r#match: Option<String>,
     },
 }
 
@@ -420,6 +475,20 @@ pub enum InstallCommand {
         /// List available dependency profiles
         #[arg(long, help = "List available dependency profiles")]
         list_profiles: bool,
+        /// Only install per-repo Python deps for repositories in the given group(s)
+        #[arg(
+            long,
+            value_name = "NAMES",
+            help = "Only install per-repo Python deps for repositories in these comma-separated group(s)"
+        )]
+        include_group: Option<String>,
+        /// Exclude per-repo Python deps for repositories in the given group(s)
+        #[arg(
+            long,
+            value_name = "NAMES",
+            help = "Exclude per-repo Python deps for repositories in these comma-separated group(s)"
+        )]
+        exclude_group: Option<String>,
     },
     /// Install and extract toolchains
     Toolchains {
@@ -548,9 +617,14 @@ mod tests {
 
         let cli = cli_result.unwrap();
         match &cli.command {
-            Some(Commands::ListTargets { source, target }) => {
+            Some(Commands::ListTargets {
+                source,
+                target,
+                verbose,
+            }) => {
                 assert!(source.is_none());
                 assert!(target.is_none());
+                assert!(!verbose);
             }
             _ => panic!("Expected ListTargets command"),
         }
@@ -562,9 +636,14 @@ mod tests {
 
         let cli = cli_result.unwrap();
         match &cli.command {
-            Some(Commands::ListTargets { source, target }) => {
+            Some(Commands::ListTargets {
+                source,
+                target,
+                verbose,
+            }) => {
                 assert_eq!(source, &Some("/path/to/source".to_string()));
                 assert!(target.is_none());
+                assert!(!verbose);
             }
             _ => panic!("Expected ListTargets command"),
         }
@@ -596,8 +675,11 @@ mod tests {
                 version,
                 workspace: _,
                 no_mirror: _,
+                mirror: _,
                 force: _,
                 r#match: _,
+                include_group: _,
+                exclude_group: _,
                 verbose: _,
                 install: _,
                 full: _,

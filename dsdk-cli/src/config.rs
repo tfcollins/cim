@@ -11,11 +11,14 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(target_os = "windows")]
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::messages;
+use crate::overlay::OverlayConfig;
+use crate::workspace;
 
 /// Custom deserializer for commit field that handles both strings and numbers
 /// This allows YAML values like `2025.05` to be converted to strings
@@ -39,9 +42,37 @@ where
     })
 }
 
+/// Custom deserializer for the `install:` `sentinel:` field. It accepts a
+/// YAML boolean (`true`/`false`) or, for backward compatibility with older
+/// sdk.yml files, an arbitrary string path -- any such string is treated as
+/// enabling the sentinel (its actual content is ignored; the sentinel file
+/// name is always derived from the install step's `name`), except for the
+/// literal string `"false"` (case-insensitive), which disables it just like
+/// the boolean `false`.
+pub(crate) fn deserialize_sentinel_flag<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SentinelValue {
+        Bool(bool),
+        Text(String),
+    }
+
+    Ok(
+        Option::<SentinelValue>::deserialize(deserializer)?.map(|value| match value {
+            SentinelValue::Bool(b) => b,
+            SentinelValue::Text(s) => !s.eq_ignore_ascii_case("false"),
+        }),
+    )
+}
+
 /// Custom deserializer for fields that can be either a sequence of strings or a single multiline string
 /// This allows YAML to use either list format or block scalar format with |
-fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+pub(crate) fn deserialize_string_or_vec<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -129,6 +160,11 @@ where
             #[serde(default)]
             depends_on: Option<Vec<String>>,
         },
+        // Matches `{ depends_on: [...] }` with no `commands` key.
+        // Must come after Object so that a mapping with both keys still matches Object first.
+        DependsOnly {
+            depends_on: Vec<String>,
+        },
     }
 
     #[derive(Deserialize)]
@@ -183,25 +219,160 @@ where
                 })
             }
         }
+        Some(SdkTargetValue::DependsOnly { depends_on }) => {
+            if depends_on.is_empty() {
+                None
+            } else {
+                Some(SdkTarget::CommandsWithDeps {
+                    commands: vec![],
+                    depends_on: Some(depends_on),
+                })
+            }
+        }
         None => None,
     })
 }
 
+/// Custom deserializer that treats a missing or null `gits:` key as an empty
+/// list, matching the old serde_yaml behavior noyalib no longer provides for
+/// free.
+fn deserialize_gits<'de, D>(deserializer: D) -> Result<Vec<GitConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Vec<GitConfig>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Structured form of `makefile_include` when both explicit include directives
+/// and an auto-discovery exclusion list are needed.
+///
+/// Corresponds to the YAML form:
+/// ```yaml
+/// makefile_include:
+///   files:
+///     - include extra.mk
+///   exclude:
+///     - qemu
+///     - trusted-services
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MakefileIncludeConfig {
+    /// Explicit `-include` directives to emit verbatim in the generated Makefile.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Repository names whose auto-discovered `build/<name>.mk` fragments should
+    /// be suppressed.  An empty list means no suppression.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+/// Represents the `makefile_include:` key in `sdk.yml`.
+///
+/// Supports two YAML shapes for backward compatibility:
+///
+/// **Legacy** — a plain sequence of include directives:
+/// ```yaml
+/// makefile_include:
+///   - include extra.mk
+/// ```
+///
+/// **Structured** — an object with optional `files` and `exclude` lists:
+/// ```yaml
+/// makefile_include:
+///   files:
+///     - include extra.mk
+///   exclude:
+///     - qemu
+///     - trusted-services
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum MakefileInclude {
+    /// Legacy form: a bare list of include directives.
+    Legacy(Vec<String>),
+    /// Structured form: explicit file includes and/or an exclusion list.
+    Structured(MakefileIncludeConfig),
+}
+
+impl MakefileInclude {
+    /// Returns the explicit include directive strings (e.g. `"include extra.mk"`).
+    pub fn files(&self) -> &[String] {
+        match self {
+            MakefileInclude::Legacy(v) => v,
+            MakefileInclude::Structured(c) => &c.files,
+        }
+    }
+
+    /// Returns the repository names whose auto-discovered `.mk` fragments should
+    /// be suppressed.  An empty slice means no suppression.
+    pub fn exclude(&self) -> &[String] {
+        match self {
+            MakefileInclude::Legacy(_) => &[],
+            MakefileInclude::Structured(c) => &c.exclude,
+        }
+    }
+}
+
+/// Configuration for direnv integration in the workspace.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DirenvConfig {
+    pub used: bool,
+    /// Python venv path relative to workspace root (default: ".venv")
+    #[serde(default)]
+    pub venv_path: Option<String>,
+}
+
+impl DirenvConfig {
+    pub fn venv_path_or_default(&self) -> &str {
+        self.venv_path.as_deref().unwrap_or(".venv")
+    }
+}
+
 /// Trait for SDK configurations that provide core repository and mirror information
+/// Default phases used when `phases:` is absent from sdk.yml.
+pub fn default_phases() -> Vec<String> {
+    vec![
+        "envsetup".to_string(),
+        "build".to_string(),
+        "clean".to_string(),
+        "test".to_string(),
+        "flash".to_string(),
+    ]
+}
+
+/// Built-in default mirror location used when neither `--mirror` nor the
+/// `mirror` key in `~/.config/cim/config.toml` is set.
+pub fn default_mirror() -> PathBuf {
+    PathBuf::from("$HOME/tmp/mirror")
+}
+
 pub trait SdkConfigCore {
-    fn mirror(&self) -> &PathBuf;
     fn gits(&self) -> &Vec<GitConfig>;
     fn install(&self) -> &Option<Vec<InstallConfig>>;
-    fn makefile_include(&self) -> &Option<Vec<String>>;
+    fn makefile_include(&self) -> Option<&MakefileInclude>;
+    /// Workspace-relative directory in which per-git `<name>.mk` fragments are
+    /// auto-discovered.  When `None` the default location `build/` is used.
+    fn build_folder(&self) -> &Option<String>;
+    /// Ordered list of phase names.  Controls which `sdk-<phase>` targets are
+    /// generated and which `<repo>-<phase>` overlay targets are discovered.
+    ///
+    /// The five standard phases (`envsetup`, `build`, `clean`, `test`, `flash`)
+    /// are always included.  The `phases:` key in `sdk.yml` is used to add
+    /// *extra* custom phases (e.g. `deploy`, `lint`) on top of the standard set.
+    fn phases(&self) -> Vec<String>;
+    /// Look up the top-level SDK target for a given phase name.
+    /// Returns `None` when the phase is not defined in `sdk.yml`.
+    fn phase_target(&self, phase: &str) -> Option<&SdkTarget>;
     fn envsetup(&self) -> &Option<SdkTarget>;
     fn test(&self) -> &Option<SdkTarget>;
     fn clean(&self) -> &Option<SdkTarget>;
     fn build(&self) -> &Option<SdkTarget>;
     fn flash(&self) -> &Option<SdkTarget>;
     fn variables(&self) -> &Option<HashMap<String, String>>;
+    fn direnv(&self) -> Option<&DirenvConfig>;
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct GitConfig {
     pub name: String,
     pub url: String,
@@ -221,6 +392,22 @@ pub struct GitConfig {
     /// If specified, this directory will be searched for index.rst in addition to default locations
     #[serde(default)]
     pub documentation_dir: Option<String>,
+    /// Workspace-relative paths to `requirements.txt` files providing this
+    /// repository's Python dependencies. When set, `cim install pip` creates an
+    /// isolated virtual environment for this git at `.cim/<name>/.venv` and
+    /// installs these requirements into it. Accepts a single path or a list.
+    #[serde(
+        rename = "python-deps",
+        default,
+        deserialize_with = "deserialize_string_or_vec"
+    )]
+    pub python_deps: Option<Vec<String>>,
+    /// Optional group name(s) this repository belongs to. Used by
+    /// `cim init`/`cim update` `--include-group`/`--exclude-group` filtering.
+    /// Accepts a single string or a list. A repository with no `group:` set
+    /// implicitly belongs to the "default" group.
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub group: Option<Vec<String>>,
 }
 
 /// Configuration for installing a component/tool in the workspace.
@@ -233,14 +420,42 @@ pub struct InstallConfig {
     /// Optional dependencies on other install targets
     #[serde(default)]
     pub depends_on: Option<Vec<String>>,
-    /// Optional sentinel file path for idempotency check.
-    /// If specified, installation only runs if this file doesn't exist
-    /// and creates it upon successful completion.
-    #[serde(default)]
-    pub sentinel: Option<String>,
+    /// Enables a sentinel file for idempotency: if set (truthy), installation
+    /// only runs if `.cim/<name>-installed` doesn't exist and creates it upon
+    /// successful completion. Accepts a YAML boolean, but for backward
+    /// compatibility with older sdk.yml files an arbitrary string is also
+    /// accepted and treated as `true` (its content is ignored -- the
+    /// sentinel path is always derived from `name`), except the literal
+    /// string `"false"`, which behaves like the boolean `false`.
+    #[serde(default, deserialize_with = "deserialize_sentinel_flag")]
+    pub sentinel: Option<bool>,
     /// Installation commands to execute
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub commands: Option<Vec<String>>,
+    /// Optional git name(s) this install step depends on. If any named git is
+    /// missing from the final effective `gits` list (after group/pattern
+    /// filtering and overlay resolution), this install step -- and any
+    /// install step whose `depends_on` chain leads to it -- is pruned from
+    /// the generated Makefile. Omit for steps with no git linkage (e.g.
+    /// downloading a standalone tool); such steps are unaffected by
+    /// group/overlay git exclusion and can only be removed via an overlay's
+    /// `install: remove:`.
+    #[serde(default)]
+    pub depends_on_gits: Option<Vec<String>>,
+}
+
+impl InstallConfig {
+    /// The sentinel file path for this install step, relative to the
+    /// workspace root, or `None` if sentinel tracking is disabled. Always
+    /// derived from `name` so callers never need to invent or collide on a
+    /// sentinel file name themselves.
+    pub fn sentinel_path(&self) -> Option<String> {
+        if self.sentinel == Some(true) {
+            Some(format!(".cim/{}-installed", self.name))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -267,23 +482,41 @@ pub struct ToolchainConfig {
     pub mirror_destination: Option<String>,
     /// Optional environment variables to set when running post-install commands
     /// Supports variable expansion:
-    /// - `$PWD` or `${PWD}` - expands to the toolchain installation directory
-    /// - `$WORKSPACE` or `${WORKSPACE}` - expands to the workspace root directory
-    /// - `$HOME` or `${HOME}` - expands to the user's home directory
+    /// - `$PWD` or `${PWD}` or `${{ PWD }}` - expands to the toolchain installation directory
+    /// - `$WORKSPACE` or `${WORKSPACE}` or `${{ WORKSPACE }}` - expands to the workspace root directory
+    /// - `$HOME` or `${HOME}` or `${{ HOME }}` - expands to the user's home directory
     /// - Standard environment variables (e.g., `$PATH`) are also expanded
     ///
     /// Example:
     /// ```yaml
     /// environment:
-    ///   CARGO_HOME: "$PWD/cargo"
-    ///   RUSTUP_HOME: "$PWD/rustup"
+    ///   CARGO_HOME: "${{ WORKSPACE }}/toolchains/cargo"
+    ///   RUSTUP_HOME: "${{ WORKSPACE }}/toolchains/rustup"
     ///   PATH: "$PWD/cargo/bin:$PATH"
     /// ```
     #[serde(default)]
     pub environment: Option<HashMap<String, String>>,
-    /// Optional post-install commands to run after extraction
-    /// These commands are executed in the destination directory
-    /// Only executed when actually extracting (not when reusing existing symlinks)
+    /// Optional post-install commands to run after extraction.
+    /// These commands are executed in the destination directory.
+    /// Only executed when actually extracting (not when reusing existing symlinks).
+    ///
+    /// cim expands the following variables in each command before passing it to the shell:
+    /// - `${{ WORKSPACE }}` (preferred) or `$WORKSPACE` / `${WORKSPACE}` - workspace root
+    /// - `${{ PWD }}` or `$PWD` / `${PWD}` - toolchain installation directory (dest_path)
+    /// - `${{ HOME }}` or `$HOME` / `${HOME}` - user home directory
+    /// - Any standard environment variable using `$VAR`, `${VAR}`, or `${{ VAR }}`
+    ///
+    /// The `${{ VAR }}` template syntax (with optional whitespace inside the braces) is
+    /// recommended because it is unambiguous and will not be mis-interpreted by the shell.
+    ///
+    /// Example:
+    /// ```yaml
+    /// post_install_commands: |
+    ///   mkdir -p cargo rustup
+    ///   CARGO_HOME=${{ WORKSPACE }}/toolchains/cargo \
+    ///   RUSTUP_HOME=${{ WORKSPACE }}/toolchains/rustup \
+    ///   bash ./sh.rustup.rs -y --no-modify-path
+    /// ```
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub post_install_commands: Option<Vec<String>>,
 }
@@ -310,6 +543,11 @@ impl ToolchainConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AlternateSourceConfig {
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CopyFileConfig {
     pub source: String,
     pub dest: String,
@@ -328,9 +566,69 @@ pub struct CopyFileConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+enum PackageList {
+    Flat(Vec<String>),
+    Nested(Vec<PackageListEntry>),
+}
+
+impl Default for PackageList {
+    fn default() -> Self {
+        PackageList::Flat(Vec::new())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+enum PackageListEntry {
+    Single(String),
+    Group(Vec<String>),
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PackageManagerConfig {
     pub command: String,
-    pub packages: Vec<String>,
+    packages: PackageList,
+}
+
+impl PackageManagerConfig {
+    /// Returns a flat, deduplicated list of packages.
+    ///
+    /// Accepts both a plain list (`packages: [a, b]`) and a composed list of
+    /// lists (`packages: [*base, *extras]`). Duplicate entries across groups
+    /// are removed; insertion order within each group is preserved.
+    pub fn resolved_packages(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        match &self.packages {
+            PackageList::Flat(pkgs) => {
+                for p in pkgs {
+                    if seen.insert(p.clone()) {
+                        result.push(p.clone());
+                    }
+                }
+            }
+            PackageList::Nested(entries) => {
+                for entry in entries {
+                    match entry {
+                        PackageListEntry::Single(s) => {
+                            if seen.insert(s.clone()) {
+                                result.push(s.clone());
+                            }
+                        }
+                        PackageListEntry::Group(g) => {
+                            for p in g {
+                                if seen.insert(p.clone()) {
+                                    result.push(p.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -357,22 +655,20 @@ fn deserialize_os_dependencies<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
+    use noyalib::Value;
     use serde::de::{Deserialize, Error};
-    use serde_yaml::Value;
 
     let value = Value::deserialize(deserializer)?;
     let mut result = HashMap::new();
 
     if let Value::Mapping(map) = value {
         for (key, val) in map {
-            if let Value::String(key_str) = key {
-                // Try to deserialize as OsConfig
-                // If it fails (e.g., it's a sequence for an anchor definition), skip it
-                if let Ok(os_config) = OsConfig::deserialize(val) {
-                    result.insert(key_str, os_config);
-                }
-                // Silently skip entries that aren't OsConfig (like anchor definitions)
+            // Try to deserialize as OsConfig
+            // If it fails (e.g., it's a sequence for an anchor definition), skip it
+            if let Ok(os_config) = OsConfig::deserialize(&val) {
+                result.insert(key, os_config);
             }
+            // Silently skip entries that aren't OsConfig (like anchor definitions)
         }
     } else {
         return Err(D::Error::custom("Expected a mapping"));
@@ -453,7 +749,14 @@ impl OsDependencies {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PythonProfile {
+    #[serde(default)]
     pub packages: Vec<String>,
+    /// Optional workspace-relative paths to `requirements.txt` files. Their
+    /// contents are installed alongside the inline `packages` list, letting a
+    /// profile reuse a repository's existing requirements file instead of
+    /// duplicating its pins here.
+    #[serde(default)]
+    pub requirements: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -467,9 +770,87 @@ fn default_python_profile() -> String {
     "docs".to_string()
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+/// Declares that a target's sdk.yml is based on another target ("base"),
+/// pinned to an explicit version (branch/tag). The actual remove/modify
+/// diff against the base lives in this same sdk.yml's `overlay:` key, not in
+/// this struct.
+///
+/// Accepts two YAML forms:
+///
+/// **Shorthand** — a single string, optionally with an `@version` suffix:
+/// ```yaml
+/// extends: platform-sdk@v1.4.0
+/// extends: platform-sdk
+/// ```
+///
+/// **Structured** — an object form, needed when the base target lives in a
+/// different manifest source than the current target:
+/// ```yaml
+/// extends:
+///   target: platform-sdk
+///   version: v1.4.0
+///   source: https://github.com/example/other-manifests
+/// ```
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct ExtendsConfig {
+    /// Name of the base target (e.g. "platform-sdk").
+    pub target: String,
+    /// Explicit base version (branch or tag name) to resolve against.
+    pub version: Option<String>,
+    /// Optional manifest source override. When absent, the base target is
+    /// resolved from the same source(s) used to resolve the current target.
+    pub source: Option<String>,
+}
+
+/// Custom deserializer for the `extends:` key, accepting both the shorthand
+/// string form (`target` or `target@version`) and the structured mapping
+/// form (`{target, version, source}`).
+fn deserialize_extends<'de, D>(deserializer: D) -> Result<Option<ExtendsConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ExtendsValue {
+        Shorthand(String),
+        Structured {
+            target: String,
+            #[serde(default)]
+            version: Option<String>,
+            #[serde(default)]
+            source: Option<String>,
+        },
+    }
+
+    let value = Option::<ExtendsValue>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(ExtendsValue::Shorthand(s)) => {
+            let (target, version) = match s.rsplit_once('@') {
+                Some((t, v)) => (t.to_string(), Some(v.to_string())),
+                None => (s, None),
+            };
+            Some(ExtendsConfig {
+                target,
+                version,
+                source: None,
+            })
+        }
+        Some(ExtendsValue::Structured {
+            target,
+            version,
+            source,
+        }) => Some(ExtendsConfig {
+            target,
+            version,
+            source,
+        }),
+        None => None,
+    })
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct SdkConfig {
-    pub mirror: PathBuf,
+    #[serde(default, deserialize_with = "deserialize_gits")]
     pub gits: Vec<GitConfig>,
     #[serde(default)]
     pub toolchains: Option<Vec<ToolchainConfig>>,
@@ -478,7 +859,23 @@ pub struct SdkConfig {
     #[serde(default)]
     pub install: Option<Vec<InstallConfig>>,
     #[serde(default)]
-    pub makefile_include: Option<Vec<String>>,
+    pub makefile_include: Option<MakefileInclude>,
+    /// Declares this target extends another ("base") target, pinned to an
+    /// explicit version. The remove/modify diff lives in this sdk.yml's own
+    /// `overlay:` key. See [`ExtendsConfig`] for the accepted forms.
+    #[serde(default, deserialize_with = "deserialize_extends")]
+    pub extends: Option<ExtendsConfig>,
+    /// Remove/modify diff against the `extends:` base target's content.
+    /// Only meaningful when `extends:` is set; new entries never go here --
+    /// they go directly in this sdk.yml's own `gits:`/`toolchains:`/etc.
+    #[serde(default)]
+    pub overlay: Option<OverlayConfig>,
+    /// Workspace-relative directory in which per-git `<name>.mk` fragments are
+    /// auto-discovered by `cim makefile`.  When absent the default location
+    /// `build/` is used.  This is an optional convenience key; omitting it
+    /// preserves the existing behaviour.
+    #[serde(default)]
+    pub build_folder: Option<String>,
     #[serde(default, deserialize_with = "deserialize_sdk_target")]
     pub envsetup: Option<SdkTarget>,
     #[serde(default, deserialize_with = "deserialize_sdk_target")]
@@ -494,13 +891,18 @@ pub struct SdkConfig {
     /// In YAML commands, use `${{ VAR }}` to reference these variables.
     #[serde(default)]
     pub variables: Option<HashMap<String, String>>,
+    /// Ordered list of phase names.
+    /// Controls which `sdk-<phase>` targets are generated and which
+    /// `<repo>-<phase>` overlay targets are auto-discovered.
+    /// When absent the default `[envsetup, build, clean, test, flash]` is used.
+    #[serde(default)]
+    pub phases: Option<Vec<String>>,
+    /// Optional direnv integration — generates .envrc and creates a Python venv.
+    #[serde(default)]
+    pub direnv: Option<DirenvConfig>,
 }
 
 impl SdkConfigCore for SdkConfig {
-    fn mirror(&self) -> &PathBuf {
-        &self.mirror
-    }
-
     fn gits(&self) -> &Vec<GitConfig> {
         &self.gits
     }
@@ -509,8 +911,35 @@ impl SdkConfigCore for SdkConfig {
         &self.install
     }
 
-    fn makefile_include(&self) -> &Option<Vec<String>> {
-        &self.makefile_include
+    fn makefile_include(&self) -> Option<&MakefileInclude> {
+        self.makefile_include.as_ref()
+    }
+
+    fn build_folder(&self) -> &Option<String> {
+        &self.build_folder
+    }
+
+    fn phases(&self) -> Vec<String> {
+        let mut result = default_phases();
+        if let Some(extra) = &self.phases {
+            for phase in extra {
+                if !result.contains(phase) {
+                    result.push(phase.clone());
+                }
+            }
+        }
+        result
+    }
+
+    fn phase_target(&self, phase: &str) -> Option<&SdkTarget> {
+        match phase {
+            "envsetup" => self.envsetup.as_ref(),
+            "test" => self.test.as_ref(),
+            "clean" => self.clean.as_ref(),
+            "build" => self.build.as_ref(),
+            "flash" => self.flash.as_ref(),
+            _ => None,
+        }
     }
 
     fn envsetup(&self) -> &Option<SdkTarget> {
@@ -536,6 +965,57 @@ impl SdkConfigCore for SdkConfig {
     fn variables(&self) -> &Option<HashMap<String, String>> {
         &self.variables
     }
+
+    fn direnv(&self) -> Option<&DirenvConfig> {
+        self.direnv.as_ref()
+    }
+}
+
+/// Try to produce a more specific error message when `noyalib` fails to parse an `SdkConfig`.
+///
+/// Re-parses the YAML as a raw `Value` and checks known sections for unrecognized fields,
+/// falling back to the original error when no specific cause can be identified.
+fn enhance_config_error(
+    yaml_content: &str,
+    path: &Path,
+    original_error: &noyalib::Error,
+) -> String {
+    let Ok(raw) = noyalib::from_str::<noyalib::Value>(yaml_content) else {
+        return format!(
+            "Config validation error in {}: {}",
+            path.display(),
+            original_error
+        );
+    };
+
+    let sections = ["build", "envsetup", "test", "clean", "flash"];
+    if let noyalib::Value::Mapping(ref map) = raw {
+        for &section in &sections {
+            if let Some(noyalib::Value::Mapping(ref sec_map)) = map.get(section) {
+                let known = ["commands", "depends_on"];
+                let unknown: Vec<&str> = sec_map
+                    .keys()
+                    .map(|k| k.as_str())
+                    .filter(|k| !known.contains(k))
+                    .collect();
+                if !unknown.is_empty() {
+                    return format!(
+                        "Config validation error in {}: '{}' section has unrecognized \
+                         field(s): {}. Valid fields are: commands, depends_on",
+                        path.display(),
+                        section,
+                        unknown.join(", "),
+                    );
+                }
+            }
+        }
+    }
+
+    format!(
+        "Config validation error in {}: {}",
+        path.display(),
+        original_error
+    )
 }
 
 /// Load SDK configuration from a YAML file with include support.
@@ -563,8 +1043,9 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<SdkConfig, Box<dyn std::er
     let file_content = fs::read_to_string(&path_buf)
         .map_err(|e| format!("Cannot read config file {}: {}", path_buf.display(), e))?;
 
-    let config: SdkConfig = serde_yaml::from_str(&file_content)
-        .map_err(|e| format!("Config validation error in {}: {e}", path_buf.display()))?;
+    let config: SdkConfig = noyalib::from_str(&file_content)
+        .map_err(|e| enhance_config_error(&file_content, &path_buf, &e))?;
+
     Ok(config)
 }
 
@@ -580,7 +1061,7 @@ pub fn load_os_dependencies<P: AsRef<Path>>(
     path: P,
 ) -> Result<OsDependencies, Box<dyn std::error::Error>> {
     let file_content = fs::read_to_string(path)?;
-    let os_deps: OsDependencies = serde_yaml::from_str(&file_content)?;
+    let os_deps: OsDependencies = noyalib::from_str(&file_content)?;
     Ok(os_deps)
 }
 
@@ -596,7 +1077,7 @@ pub fn load_python_dependencies<P: AsRef<Path>>(
     path: P,
 ) -> Result<PythonDependencies, Box<dyn std::error::Error>> {
     let file_content = fs::read_to_string(path)?;
-    let python_deps: PythonDependencies = serde_yaml::from_str(&file_content)?;
+    let python_deps: PythonDependencies = noyalib::from_str(&file_content)?;
     Ok(python_deps)
 }
 
@@ -624,13 +1105,13 @@ pub struct UserConfig {
     #[serde(default)]
     pub default_source: Option<String>,
 
+    /// Additional manifest sources to search alongside default_source
+    #[serde(default)]
+    pub alternate_sources: Option<Vec<AlternateSourceConfig>>,
+
     /// Skip mirror operations (behaves as if --no-mirror flag is always specified)
     #[serde(default)]
     pub no_mirror: Option<bool>,
-
-    /// Directory for storing temporary files during docker create operations
-    #[serde(default)]
-    pub docker_temp_dir: Option<PathBuf>,
 
     /// Additional files to copy during initialization (merged with manifest)
     #[serde(default)]
@@ -681,10 +1162,8 @@ impl UserConfig {
             }
         }
 
-        let home = env::var("HOME")
-            .or_else(|_| env::var("USERPROFILE"))
-            .unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home)
+        workspace::get_home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
             .join(".config")
             .join("cim")
             .join("config.toml")
@@ -707,7 +1186,14 @@ impl UserConfig {
 # Override the default mirror directory location.
 # The mirror stores git repositories and toolchains for fast workspace creation.
 #
-# Default: $HOME/tmp/mirror
+# Resolution order (highest priority first):
+#   1. --mirror <DIR>     command-line flag (init / update)
+#   2. mirror = ...       this config file
+#   3. $HOME/tmp/mirror   built-in default
+#
+# Note: a `mirror:` key in sdk.yml is ignored. Configure the mirror here or
+# with --mirror instead.
+#
 # Use cases:
 #   - Store on faster SSD for better performance
 #   - Use shared network location for team collaboration
@@ -774,6 +1260,29 @@ impl UserConfig {
 # default_source = "https://github.com/analogdevicesinc/cim-manifests"
 
 # =============================================================================
+# Alternate Manifest Sources
+# =============================================================================
+# Additional manifest repositories or directories to search alongside
+# default_source. When listing targets, results from all sources are merged
+# and displayed grouped by source. For 'init', the first source containing
+# the requested target wins (default_source is tried first).
+#
+# Use cases:
+#   - Use company manifests + personal fork with custom targets
+#   - Combine manifests from multiple teams or product lines
+#   - Test new targets in a side repository before merging upstream
+#
+# Examples:
+# [[alternate_sources]]
+# url = "https://github.com/myteam/custom-manifests"
+#
+# [[alternate_sources]]
+# url = "git@github.com:team-b/manifests.git"
+#
+# [[alternate_sources]]
+# url = "/home/user/experimental-manifests"
+
+# =============================================================================
 # Skip Mirror Operations
 # =============================================================================
 # Skip mirror operations and clone repositories directly from remote URLs.
@@ -789,25 +1298,6 @@ impl UserConfig {
 # Examples:
 # no_mirror = true
 # no_mirror = false
-
-# =============================================================================
-# Docker Temporary Directory
-# =============================================================================
-# Directory for storing temporary manifest files during 'docker create' operations.
-# These files are extracted from the manifest repository and used to generate
-# the Dockerfile, then cleaned up after successful generation.
-#
-# Default: /tmp/cim-docker
-# Use cases:
-#   - Control where temporary files are stored
-#   - Use a different partition with more space
-#   - Organize temp files in a predictable location
-#   - Debug manifest extraction issues
-#
-# Examples:
-# docker_temp_dir = "/tmp/cim-docker"
-# docker_temp_dir = "/Users/user/.cache/cim/docker"
-# docker_temp_dir = "/var/tmp/cim-docker"
 
 # =============================================================================
 # Additional Copy Files
@@ -1021,18 +1511,6 @@ impl UserConfig {
     pub fn apply_to_sdk_config(&self, config: &mut SdkConfig, verbose: bool) -> usize {
         let mut override_count = 0;
 
-        if let Some(ref mirror) = self.mirror {
-            if verbose {
-                messages::verbose(&format!(
-                    "User config override: mirror {} -> {}",
-                    config.mirror.display(),
-                    mirror.display()
-                ));
-            }
-            config.mirror = mirror.clone();
-            override_count += 1;
-        }
-
         if let Some(ref user_copy_files) = self.copy_files {
             if verbose {
                 messages::verbose(&format!(
@@ -1066,11 +1544,13 @@ impl UserConfig {
         if let Some(ref source) = self.default_source {
             lines.push(format!("default_source={}", source));
         }
+        if let Some(ref alts) = self.alternate_sources {
+            for (idx, alt) in alts.iter().enumerate() {
+                lines.push(format!("alternate_sources.{}.url={}", idx, alt.url));
+            }
+        }
         if let Some(no_mirror) = self.no_mirror {
             lines.push(format!("no_mirror={}", no_mirror));
-        }
-        if let Some(ref temp_dir) = self.docker_temp_dir {
-            lines.push(format!("docker_temp_dir={}", temp_dir.display()));
         }
         if let Some(ref files) = self.copy_files {
             for (idx, file) in files.iter().enumerate() {
@@ -1109,16 +1589,28 @@ impl UserConfig {
             "workspace_prefix" => self.workspace_prefix.clone(),
             "default_source" => self.default_source.clone(),
             "no_mirror" => self.no_mirror.map(|b| b.to_string()),
-            "docker_temp_dir" => self
-                .docker_temp_dir
-                .as_ref()
-                .map(|p| p.display().to_string()),
             "shell" => self.shell.clone(),
             "shell_arg" => self.shell_arg.clone(),
             "documentation_dirs" => self.documentation_dirs.clone(),
             "cert_validation" => self.cert_validation.clone(),
             "no_dividers" => self.no_dividers.map(|b| b.to_string()),
             _ => {
+                // Handle nested keys like alternate_sources.0.url
+                if key.starts_with("alternate_sources.") {
+                    let parts: Vec<&str> = key.split('.').collect();
+                    if parts.len() == 3 {
+                        if let Ok(idx) = parts[1].parse::<usize>() {
+                            if let Some(ref alts) = self.alternate_sources {
+                                if let Some(alt) = alts.get(idx) {
+                                    return match parts[2] {
+                                        "url" => Some(alt.url.clone()),
+                                        _ => None,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
                 // Handle nested keys like copy_files.0.src
                 if key.starts_with("copy_files.") {
                     let parts: Vec<&str> = key.split('.').collect();
@@ -1158,7 +1650,7 @@ pub fn load_config_with_os_deps<P: AsRef<Path>>(
 
     // Try to load os-dependencies.yml from the same directory as sdk.yml
     let os_deps = if let Some(config_dir) = path_buf.parent() {
-        let os_deps_path = config_dir.join("os-dependencies.yml");
+        let os_deps_path = config_dir.join(workspace::OS_DEPS_FILE);
         if os_deps_path.exists() {
             match load_os_dependencies(&os_deps_path) {
                 Ok(deps) => Some(deps),
@@ -1347,17 +1839,40 @@ gits:
     #[test]
     fn test_load_config_valid() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("sdk.yml");
+        let file_path = dir.path().join(workspace::SDK_CONFIG_FILE);
         let mut file = File::create(&file_path).unwrap();
         file.write_all(YAML.as_bytes()).unwrap();
         let config = load_config(&file_path).unwrap();
-        assert_eq!(config.mirror.to_str().unwrap(), "/tmp/mirror");
         assert_eq!(config.gits.len(), 2);
         assert_eq!(config.gits[0].name, "git");
         assert_eq!(
             config.gits[1].build_depends_on.as_ref().unwrap(),
             &vec!["git".to_string()]
         );
+    }
+
+    #[test]
+    fn test_manifest_mirror_key_is_ignored() {
+        // A manifest carrying a `mirror:` key still parses; the key is dropped.
+        let yaml = "mirror: /some/manifest/mirror\ngits: []\n";
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join(workspace::SDK_CONFIG_FILE);
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        assert!(load_config(&file_path).is_ok());
+    }
+
+    #[test]
+    fn test_missing_mirror_key_loads() {
+        // `mirror:` is not required; a manifest without it loads fine.
+        let yaml = "gits: []\n";
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join(workspace::SDK_CONFIG_FILE);
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        assert!(load_config(&file_path).is_ok());
     }
 
     #[test]
@@ -1368,6 +1883,60 @@ gits:
         file.write_all(b"not: yaml: - at all").unwrap();
         let result = load_config(&file_path);
         assert!(result.is_err());
+    }
+
+    fn parse_install(yaml: &str) -> InstallConfig {
+        noyalib::from_str(yaml).expect("install entry should parse")
+    }
+
+    #[test]
+    fn test_sentinel_absent_is_disabled() {
+        let install = parse_install("name: foo\n");
+        assert_eq!(install.sentinel, None);
+        assert_eq!(install.sentinel_path(), None);
+    }
+
+    #[test]
+    fn test_sentinel_bool_true_derives_path_from_name() {
+        let install = parse_install("name: foo\nsentinel: true\n");
+        assert_eq!(install.sentinel, Some(true));
+        assert_eq!(
+            install.sentinel_path().as_deref(),
+            Some(".cim/foo-installed")
+        );
+    }
+
+    #[test]
+    fn test_sentinel_bool_false_is_disabled() {
+        let install = parse_install("name: foo\nsentinel: false\n");
+        assert_eq!(install.sentinel, Some(false));
+        assert_eq!(install.sentinel_path(), None);
+    }
+
+    #[test]
+    fn test_sentinel_legacy_string_is_treated_as_true() {
+        // Backward compatibility: an arbitrary legacy sentinel path string is
+        // treated as a truthy flag; its content is ignored in favor of a
+        // path derived from `name`.
+        let install = parse_install("name: foo\nsentinel: .cim/.foo-installed\n");
+        assert_eq!(install.sentinel, Some(true));
+        assert_eq!(
+            install.sentinel_path().as_deref(),
+            Some(".cim/foo-installed")
+        );
+    }
+
+    #[test]
+    fn test_sentinel_string_false_is_disabled() {
+        for value in ["false", "FALSE", "False"] {
+            let install = parse_install(&format!("name: foo\nsentinel: \"{value}\"\n"));
+            assert_eq!(
+                install.sentinel,
+                Some(false),
+                "value {value} should disable sentinel"
+            );
+            assert_eq!(install.sentinel_path(), None);
+        }
     }
 
     #[test]
@@ -1385,7 +1954,7 @@ gits:
     url: https://github.com/example/repo1.git
     commit: main
     build: *shared_build
-  
+
   - name: repo2
     url: https://github.com/example/repo2.git
     commit: main
@@ -1437,6 +2006,101 @@ gits:
 
         assert_eq!(build[0], "@echo This must be quoted");
         assert_eq!(build[1], "make test");
+    }
+
+    #[test]
+    fn test_build_depends_on_only() {
+        let yaml = r#"
+mirror: /tmp/mirror
+gits: []
+build:
+  depends_on:
+    - zephyrproject/zephyr
+    - some-other-repo
+"#;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join(workspace::SDK_CONFIG_FILE);
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        let config = load_config(&file_path).unwrap();
+        let build = config
+            .build
+            .as_ref()
+            .expect("build section should be present");
+        assert_eq!(build.commands(), &[] as &[String]);
+        let expected: Vec<String> = vec![
+            "zephyrproject/zephyr".to_string(),
+            "some-other-repo".to_string(),
+        ];
+        assert_eq!(build.depends_on(), Some(expected.as_slice()));
+    }
+
+    #[test]
+    fn test_build_unknown_field_error() {
+        let yaml = r#"
+mirror: /tmp/mirror
+gits: []
+build:
+  typo_field: value
+"#;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join(workspace::SDK_CONFIG_FILE);
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        let result = load_config(&file_path);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unrecognized field") && msg.contains("typo_field"),
+            "expected error mentioning 'unrecognized field' and 'typo_field', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_install_depends_on_gits() {
+        let yaml = r#"
+mirror: /tmp/mirror
+gits:
+  - name: zephyr
+    url: https://github.com/zephyrproject-rtos/zephyr.git
+    commit: main
+install:
+  - name: zephyr-python-deps
+    depends_on_gits:
+      - zephyr
+    commands:
+      - pip install -r requirements.txt
+"#;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join(workspace::SDK_CONFIG_FILE);
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        let config = load_config(&file_path).unwrap();
+        let install = config.install.as_ref().expect("install section missing");
+        assert_eq!(install[0].depends_on_gits, Some(vec!["zephyr".to_string()]));
+    }
+
+    #[test]
+    fn test_install_depends_on_gits_defaults_to_none() {
+        let yaml = r#"
+mirror: /tmp/mirror
+gits: []
+install:
+  - name: standalone-tool
+    commands:
+      - echo install
+"#;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join(workspace::SDK_CONFIG_FILE);
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(yaml.as_bytes()).unwrap();
+
+        let config = load_config(&file_path).unwrap();
+        let install = config.install.as_ref().expect("install section missing");
+        assert_eq!(install[0].depends_on_gits, None);
     }
 
     #[test]
@@ -1586,10 +2250,8 @@ mirror = "/only/mirror/set"
             name: name.to_string(),
             url: format!("https://example.com/{}.git", name),
             commit: "main".to_string(),
-            build_depends_on: None,
             git_depends_on: git_depends_on.map(|v| v.into_iter().map(String::from).collect()),
-            build: None,
-            documentation_dir: None,
+            ..Default::default()
         }
     }
 
@@ -1681,9 +2343,7 @@ mirror = "/only/mirror/set"
             url: "https://example.com/my-repo.git".to_string(),
             commit: "main".to_string(),
             build_depends_on: Some(vec!["sdk-envsetup".to_string()]),
-            git_depends_on: None,
-            build: None,
-            documentation_dir: None,
+            ..Default::default()
         }];
         let tiers = resolve_clone_order(&gits).unwrap();
         assert_eq!(tiers.len(), 1);
@@ -1705,5 +2365,63 @@ mirror = "/only/mirror/set"
         assert_eq!(tiers[1].len(), 2);
         assert_eq!(tiers[2].len(), 1);
         assert_eq!(tiers[2][0].name, "d");
+    }
+
+    #[test]
+    fn test_user_config_alternate_sources_table() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let content = r#"
+default_source = "https://example.com/manifests"
+
+[[alternate_sources]]
+url = "https://alt1.com/repo"
+
+[[alternate_sources]]
+url = "https://alt2.com/repo"
+"#;
+        fs::write(&config_path, content).unwrap();
+
+        let config = UserConfig::load_from(&config_path).unwrap().unwrap();
+        assert_eq!(
+            config.default_source.unwrap(),
+            "https://example.com/manifests"
+        );
+        let alts = config.alternate_sources.unwrap();
+        assert_eq!(alts.len(), 2);
+        assert_eq!(alts[0].url, "https://alt1.com/repo");
+        assert_eq!(alts[1].url, "https://alt2.com/repo");
+    }
+
+    #[test]
+    fn test_user_config_alternate_sources_ssh() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let content = r#"
+[[alternate_sources]]
+url = "git@github.com:team/manifests.git"
+"#;
+        fs::write(&config_path, content).unwrap();
+
+        let config = UserConfig::load_from(&config_path).unwrap().unwrap();
+        let alts = config.alternate_sources.unwrap();
+        assert_eq!(alts.len(), 1);
+        assert_eq!(alts[0].url, "git@github.com:team/manifests.git");
+    }
+
+    #[test]
+    fn test_user_config_no_alternate_sources() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let content = r#"
+default_source = "https://example.com/manifests"
+"#;
+        fs::write(&config_path, content).unwrap();
+
+        let config = UserConfig::load_from(&config_path).unwrap().unwrap();
+        assert!(config.alternate_sources.is_none());
     }
 }

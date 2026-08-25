@@ -16,22 +16,82 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Get the default manifest source location, considering user config
-pub fn get_default_source() -> String {
-    // Try to load user config to get default_source
-    if let Ok(Some(user_config)) = config::UserConfig::load() {
-        if let Some(ref default_source) = user_config.default_source {
-            return default_source.clone();
+/// Filename for the main SDK configuration manifest. A target's `extends:`
+/// remove/modify diff against its base lives in this same file's `overlay:`
+/// key (see `overlay.rs`), not in a separate file.
+pub const SDK_CONFIG_FILE: &str = "sdk.yml";
+/// Filename for OS/system dependency definitions
+pub const OS_DEPS_FILE: &str = "os-dependencies.yml";
+/// Filename for Python dependency definitions
+pub const PYTHON_DEPS_FILE: &str = "python-dependencies.yml";
+/// Filename for the workspace marker
+pub const WORKSPACE_MARKER_FILE: &str = ".workspace";
+/// Subfolder (nested under the existing `.cim/` cim-internal directory,
+/// alongside per-git venvs) holding every `extends:` ancestor's own
+/// manifest/dependency files (`<target>-sdk.yml`,
+/// `<target>-os-dependencies.yml`, `<target>-python-dependencies.yml`),
+/// keeping the workspace root uncluttered with only the primary target's
+/// bare-named files.
+pub const OVERLAYS_DIR: &str = ".cim/target-overlays";
+
+/// Discover every file matching `base_filename` for a workspace -- either
+/// the bare name at `workspace_path` root (the primary target's own file,
+/// e.g. `os-dependencies.yml`) or an ancestor-prefixed name
+/// (`<target>-os-dependencies.yml`) under `workspace_path/.cim/target-overlays/`,
+/// copied in verbatim from an `extends:` ancestor by `cim init`, mirroring
+/// how `<target>-sdk.yml` is named.
+///
+/// Returns paths sorted with the bare-named file first (if present), then
+/// ancestor files in alphabetical order, for deterministic output. Since
+/// os-dependencies.yml/python-dependencies.yml are not overlay-able (each
+/// level's file is applied independently, in full -- see the module docs in
+/// `overlay.rs`), callers are expected to process every returned file
+/// separately; running the same underlying install command more than once
+/// (e.g. `brew install`/`apt install`/`pip install`) is expected and fine.
+pub fn discover_dependency_files(workspace_path: &Path, base_filename: &str) -> Vec<PathBuf> {
+    let bare_path = workspace_path.join(base_filename);
+    let mut ancestor_paths: Vec<PathBuf> = Vec::new();
+
+    let overlays_dir = workspace_path.join(OVERLAYS_DIR);
+    if let Ok(entries) = fs::read_dir(&overlays_dir) {
+        let suffix = format!("-{}", base_filename);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(&suffix) {
+                ancestor_paths.push(path);
+            }
         }
     }
+    ancestor_paths.sort();
 
-    // Fall back to hardcoded default with legacy path support
-    // On Windows, use USERPROFILE if HOME is not set
-    let home = env::var("HOME")
+    let mut result = Vec::with_capacity(ancestor_paths.len() + 1);
+    if bare_path.exists() {
+        result.push(bare_path);
+    }
+    result.extend(ancestor_paths);
+    result
+}
+
+/// Get the user's home directory path.
+///
+/// Tries `HOME` first (Unix/macOS), falls back to `USERPROFILE` (Windows).
+/// Returns `None` if neither variable is set.
+pub fn get_home_dir() -> Option<PathBuf> {
+    env::var("HOME")
         .or_else(|_| env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
+        .ok()
+        .map(PathBuf::from)
+}
 
-    let home_path = PathBuf::from(&home);
+/// Hardcoded fallback for default manifest source (no config file I/O)
+fn default_source_fallback() -> String {
+    let home_path = get_home_dir().unwrap_or_else(|| PathBuf::from("."));
     let devel_dir = home_path.join("devel");
 
     // Check for new path: $HOME/devel/cim-manifests
@@ -55,30 +115,42 @@ pub fn get_default_source() -> String {
     new_path.to_string_lossy().to_string()
 }
 
-/// Get the docker temporary directory, considering user config
-/// Creates the directory if it doesn't exist
-pub fn get_docker_temp_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // Try to load user config to get docker_temp_dir
-    let temp_dir = if let Ok(Some(user_config)) = config::UserConfig::load() {
-        if let Some(ref docker_temp) = user_config.docker_temp_dir {
-            docker_temp.clone()
-        } else {
-            PathBuf::from("/tmp/cim-docker")
+/// Get the default manifest source location, considering user config
+pub fn get_default_source() -> String {
+    if let Ok(Some(user_config)) = config::UserConfig::load() {
+        if let Some(ref default_source) = user_config.default_source {
+            return default_source.clone();
         }
-    } else {
-        PathBuf::from("/tmp/cim-docker")
-    };
-
-    // Create directory if it doesn't exist
-    if !temp_dir.exists() {
-        fs::create_dir_all(&temp_dir)?;
-        messages::verbose(&format!(
-            "Created docker temp directory: {}",
-            temp_dir.display()
-        ));
     }
+    default_source_fallback()
+}
 
-    Ok(temp_dir)
+/// Get all manifest sources (default + alternates), deduplicated.
+/// Accepts a pre-loaded UserConfig to avoid redundant file I/O.
+pub fn get_all_sources_from_config(user_config: Option<&config::UserConfig>) -> Vec<String> {
+    let default = match user_config.and_then(|uc| uc.default_source.as_ref()) {
+        Some(ds) => expand_env_vars(ds),
+        None => default_source_fallback(),
+    };
+    let alternates = user_config
+        .and_then(|uc| uc.alternate_sources.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let mut sources = vec![default.clone()];
+    for alt in alternates {
+        let cleaned = expand_env_vars(alt.url.trim());
+        if !cleaned.is_empty() && cleaned != default {
+            sources.push(cleaned);
+        }
+    }
+    sources
+}
+
+/// Get all manifest sources (default + alternates), deduplicated.
+/// Convenience wrapper that loads UserConfig internally.
+pub fn get_all_sources() -> Vec<String> {
+    let uc = config::UserConfig::load().ok().flatten();
+    get_all_sources_from_config(uc.as_ref())
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -98,6 +170,17 @@ pub struct WorkspaceMarker {
     /// Directory containing the original config file (for resolving relative copy_files paths)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_source_dir: Option<String>,
+    /// Regex pattern used to filter repositories during init (--match option)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_pattern: Option<String>,
+    /// Comma-separated group names to include, used to filter repositories
+    /// during init (--include-group option)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_groups: Option<String>,
+    /// Comma-separated group names to exclude, used to filter repositories
+    /// during init (--exclude-group option)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_groups: Option<String>,
 }
 
 /// Find the workspace root by walking up directories looking for .workspace marker
@@ -105,7 +188,7 @@ pub fn find_workspace_root() -> Option<PathBuf> {
     let mut current = env::current_dir().ok()?;
 
     loop {
-        let marker_path = current.join(".workspace");
+        let marker_path = current.join(WORKSPACE_MARKER_FILE);
         if marker_path.exists() {
             return Some(current);
         }
@@ -128,6 +211,9 @@ pub struct CreateWorkspaceMarkerParams<'a> {
     pub target_version: Option<&'a str>,
     pub skip_mirror: bool,
     pub source_url: Option<&'a str>,
+    pub match_pattern: Option<&'a str>,
+    pub include_group: Option<&'a str>,
+    pub exclude_group: Option<&'a str>,
 }
 
 /// Create workspace marker file
@@ -174,7 +260,7 @@ pub fn create_workspace_marker(
             .map(|p| p.to_string_lossy().to_string())
     };
 
-    let marker_path = params.workspace_path.join(".workspace");
+    let marker_path = params.workspace_path.join(WORKSPACE_MARKER_FILE);
     let marker = WorkspaceMarker {
         workspace_version: "1".to_string(),
         created_at: std::time::SystemTime::now()
@@ -192,13 +278,47 @@ pub fn create_workspace_marker(
         cim_commit,
         no_mirror: if params.skip_mirror { Some(true) } else { None },
         config_source_dir,
+        match_pattern: params.match_pattern.map(|s| s.to_string()),
+        include_groups: params.include_group.map(|s| s.to_string()),
+        exclude_groups: params.exclude_group.map(|s| s.to_string()),
     };
 
-    fs::write(&marker_path, serde_yaml::to_string(&marker)?)?;
+    fs::write(&marker_path, noyalib::to_string(&marker)?)?;
     messages::verbose(&format!(
         "Created workspace marker: {}",
         marker_path.display()
     ));
+    Ok(())
+}
+
+/// Update the match_pattern field in an existing workspace marker file.
+/// Pass `None` to clear the stored match pattern.
+pub fn update_workspace_marker_match_pattern(
+    workspace_path: &Path,
+    match_pattern: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
+    let content = fs::read_to_string(&marker_path)?;
+    let mut marker: WorkspaceMarker = noyalib::from_str(&content)?;
+    marker.match_pattern = match_pattern.map(|s| s.to_string());
+    fs::write(&marker_path, noyalib::to_string(&marker)?)?;
+    Ok(())
+}
+
+/// Update the include_groups/exclude_groups fields in an existing workspace
+/// marker file. Pass `None` for either argument to clear that stored
+/// selection.
+pub fn update_workspace_marker_groups(
+    workspace_path: &Path,
+    include_groups: Option<&str>,
+    exclude_groups: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
+    let content = fs::read_to_string(&marker_path)?;
+    let mut marker: WorkspaceMarker = noyalib::from_str(&content)?;
+    marker.include_groups = include_groups.map(|s| s.to_string());
+    marker.exclude_groups = exclude_groups.map(|s| s.to_string());
+    fs::write(&marker_path, noyalib::to_string(&marker)?)?;
     Ok(())
 }
 
@@ -284,7 +404,7 @@ pub fn resolve_target_config_from_git(
 
     // Check if target exists and has sdk.yml
     let target_dir = temp_path.join("targets").join(target);
-    let config_path = target_dir.join("sdk.yml");
+    let config_path = target_dir.join(SDK_CONFIG_FILE);
 
     if !config_path.exists() {
         return Err(anyhow::anyhow!(
@@ -334,7 +454,7 @@ pub fn resolve_target_config_from_git(
     copy_dir_recursive(&target_dir, &extraction_path)
         .map_err(|e| anyhow::anyhow!("Failed to copy target directory contents: {}", e))?;
 
-    let persistent_config = extraction_path.join("sdk.yml");
+    let persistent_config = extraction_path.join(SDK_CONFIG_FILE);
 
     // If using tempfile, keep the directory alive by forgetting it (init command behavior)
     if let Some(temp_keeper) = temp_dir_keeper {
@@ -352,7 +472,7 @@ pub fn resolve_config_source_dir_from_marker(
     workspace_path: &Path,
     config_path: &Path,
 ) -> (PathBuf, Option<tempfile::TempDir>) {
-    let marker_path = workspace_path.join(".workspace");
+    let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
     if !marker_path.exists() {
         return (workspace_path.to_path_buf(), None);
     }
@@ -362,7 +482,7 @@ pub fn resolve_config_source_dir_from_marker(
         Err(_) => return (workspace_path.to_path_buf(), None),
     };
 
-    let marker = match serde_yaml::from_str::<WorkspaceMarker>(&content) {
+    let marker = match noyalib::from_str::<WorkspaceMarker>(&content) {
         Ok(m) => m,
         Err(_) => return (workspace_path.to_path_buf(), None),
     };
@@ -422,9 +542,27 @@ pub fn get_current_workspace() -> Result<PathBuf, String> {
     })
 }
 
-/// Check if a string represents a URL (http:// or https://)
+/// Resolve the current workspace and verify that sdk.yml exists.
+///
+/// Returns the workspace path and the config file path. This is a convenience
+/// function that combines the common pattern of getting the workspace, constructing
+/// the config path, and checking that it exists.
+pub fn require_workspace_config() -> Result<(PathBuf, PathBuf), String> {
+    let workspace_path = get_current_workspace()?;
+    let config_path = workspace_path.join(SDK_CONFIG_FILE);
+    if !config_path.exists() {
+        return Err(format!(
+            "sdk.yml not found in workspace root: {}. \
+             The workspace may be corrupted. Try running 'cim init' to reinitialize.",
+            workspace_path.display()
+        ));
+    }
+    Ok((workspace_path, config_path))
+}
+
+/// Check if a string represents a URL (http://, https://, or git@ SSH)
 pub fn is_url(input: &str) -> bool {
-    input.starts_with("http://") || input.starts_with("https://")
+    input.starts_with("http://") || input.starts_with("https://") || input.starts_with("git@")
 }
 
 /// Expand environment variables in a path string
@@ -446,13 +584,41 @@ pub fn is_url(input: &str) -> bool {
 /// expand_env_vars("%HOME%/workspace") => "C:\\Users\\alice/workspace"
 /// ```
 pub fn expand_env_vars(path: &str) -> String {
+    expand_env_vars_with_overrides(path, &std::collections::HashMap::new())
+}
+
+/// Expand environment variables in a path string, with caller-supplied overrides.
+///
+/// Overrides are checked before the process environment. This allows callers to
+/// inject context-specific variables (e.g. PWD, WORKSPACE) that shadow any
+/// real environment variable with the same name.
+///
+/// Supports Unix-style `$VAR` and `${VAR}`, Windows-style `%VAR%`, and tilde
+/// (`~`) expansion.  Unknown variables are left unchanged.
+pub fn expand_env_vars_with_overrides(
+    path: &str,
+    overrides: &std::collections::HashMap<&str, &str>,
+) -> String {
     let mut result = path.to_string();
+
+    /// Resolve a variable name: check overrides first, then env, with HOME fallback.
+    fn resolve_var(
+        name: &str,
+        overrides: &std::collections::HashMap<&str, &str>,
+    ) -> Option<String> {
+        if let Some(&val) = overrides.get(name) {
+            return Some(val.to_string());
+        }
+        if name == "HOME" {
+            env::var("HOME").or_else(|_| env::var("USERPROFILE")).ok()
+        } else {
+            env::var(name).ok()
+        }
+    }
 
     // Handle tilde expansion first
     if result.starts_with("~/") || result == "~" {
-        // Try HOME first (Unix), then USERPROFILE (Windows)
-        let home = env::var("HOME").or_else(|_| env::var("USERPROFILE"));
-        if let Ok(home) = home {
+        if let Some(home) = resolve_var("HOME", overrides) {
             if result == "~" {
                 result = home;
             } else {
@@ -469,15 +635,8 @@ pub fn expand_env_vars(path: &str) -> String {
     // Handle Windows %VAR% syntax
     while let Some(start) = result.find('%') {
         if let Some(end) = result[start + 1..].find('%') {
-            let var_name = &result[start + 1..start + 1 + end];
-            // Special handling for HOME: try HOME first, then USERPROFILE on Windows
-            let value = if var_name == "HOME" {
-                env::var("HOME").or_else(|_| env::var("USERPROFILE"))
-            } else {
-                env::var(var_name)
-            };
-
-            if let Ok(value) = value {
+            let var_name = &result[start + 1..start + 1 + end].to_string();
+            if let Some(value) = resolve_var(var_name, overrides) {
                 result.replace_range(start..start + end + 2, &value);
             } else {
                 // If variable not found, break to avoid infinite loop
@@ -491,15 +650,8 @@ pub fn expand_env_vars(path: &str) -> String {
     // Handle ${VAR} syntax
     while let Some(start) = result.find("${") {
         if let Some(end) = result[start..].find('}') {
-            let var_name = &result[start + 2..start + end];
-            // Special handling for HOME: try HOME first, then USERPROFILE on Windows
-            let value = if var_name == "HOME" {
-                env::var("HOME").or_else(|_| env::var("USERPROFILE"))
-            } else {
-                env::var(var_name)
-            };
-
-            if let Ok(value) = value {
+            let var_name = &result[start + 2..start + end].to_string();
+            if let Some(value) = resolve_var(var_name, overrides) {
                 result.replace_range(start..start + end + 1, &value);
             } else {
                 // If variable not found, break to avoid infinite loop
@@ -528,14 +680,7 @@ pub fn expand_env_vars(path: &str) -> String {
 
             if var_end > var_start {
                 let var_name: String = chars[var_start..var_end].iter().collect();
-                // Special handling for HOME: try HOME first, then USERPROFILE on Windows
-                let value = if var_name == "HOME" {
-                    env::var("HOME").or_else(|_| env::var("USERPROFILE"))
-                } else {
-                    env::var(&var_name)
-                };
-
-                if let Ok(value) = value {
+                if let Some(value) = resolve_var(&var_name, overrides) {
                     // Replace $VAR with the actual value
                     let replacement: Vec<char> = value.chars().collect();
                     chars.splice(i..var_end, replacement);
@@ -554,18 +699,61 @@ pub fn expand_env_vars(path: &str) -> String {
     chars.into_iter().collect()
 }
 
+/// Return `true` if `s` contains a `$` that is **not** part of a `${{ … }}`
+/// manifest-variable reference.
+///
+/// `${{ VAR }}` patterns are intentionally kept as-is so that Makefile
+/// generation can later convert them to `$(VAR)` Make references.  They must
+/// not trigger the "unresolved host env var" warning.
+///
+/// # Examples
+///
+/// ```
+/// use dsdk_cli::workspace::has_unresolved_env_var_refs;
+///
+/// assert!(!has_unresolved_env_var_refs("https://example.com"));
+/// assert!(!has_unresolved_env_var_refs("${{ WORKSPACE }}/bin"));
+/// assert!(!has_unresolved_env_var_refs("${{ A }}/${{ B }}"));
+/// assert!(has_unresolved_env_var_refs("$UNSET_HOST_VAR/path"));
+/// assert!(has_unresolved_env_var_refs("${{ WORKSPACE }}/$UNSET"));
+/// ```
+pub fn has_unresolved_env_var_refs(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            // Check for ${{ … }} pattern — skip it entirely.
+            if bytes.get(i + 1) == Some(&b'{') && bytes.get(i + 2) == Some(&b'{') {
+                if let Some(rel) = s[i + 3..].find("}}") {
+                    i = i + 3 + rel + 2;
+                    continue;
+                }
+            }
+            // A bare `$` that is not part of a manifest-variable reference.
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Resolve manifest variable values by expanding host env vars within them.
 ///
 /// Each value in the raw map is passed through [`expand_env_vars`]. If a value
-/// still contains a `$` character after expansion, the referenced host env var
-/// was not set — a warning is logged so the user knows the variable is unresolved.
+/// still contains a `$` character after expansion — and that `$` is **not**
+/// part of a `${{ VAR }}` manifest-variable reference — a warning is logged so
+/// the user knows the variable is unresolved.
+///
+/// `${{ VAR }}` patterns are left in place intentionally: Makefile generation
+/// will convert them to `$(VAR)` Make references at a later stage.
 ///
 /// # Example
 ///
 /// ```text
 /// variables:
-///   DOCKER_DEFAULT_PLATFORM: $HOST_DEFAULT_PLATFORM   # resolved from env
-///   SDK_BASE_URL: https://example.com/sdk              # literal
+///   DOCKER_DEFAULT_PLATFORM: $HOST_DEFAULT_PLATFORM    # resolved from env
+///   SDK_BASE_URL: https://example.com/sdk               # literal
+///   TOOLCHAIN_PATH: ${{ WORKSPACE }}/toolchains/bin    # passed to Make
 /// ```
 pub fn resolve_variables(
     raw: &std::collections::HashMap<String, String>,
@@ -573,7 +761,7 @@ pub fn resolve_variables(
     raw.iter()
         .map(|(key, value)| {
             let resolved = expand_env_vars(value);
-            if resolved.contains('$') {
+            if has_unresolved_env_var_refs(&resolved) {
                 messages::info(&format!(
                     "Warning: manifest variable '{}' has an unresolved reference in value: '{}'",
                     key, resolved
@@ -582,6 +770,171 @@ pub fn resolve_variables(
             (key.clone(), resolved)
         })
         .collect()
+}
+
+/// Convert a git entry name to its `_DIR` variable name.
+///
+/// Rules:
+/// - Take the last path component (e.g., "zephyrproject/zephyr" -> "zephyr")
+/// - Uppercase the result
+/// - Replace hyphens and dots with underscores
+/// - Append `_DIR`
+///
+/// # Examples
+///
+/// ```
+/// use dsdk_cli::workspace::git_name_to_dir_var;
+///
+/// assert_eq!(git_name_to_dir_var("u-boot"), "U_BOOT_DIR");
+/// assert_eq!(git_name_to_dir_var("linux-stable"), "LINUX_STABLE_DIR");
+/// assert_eq!(git_name_to_dir_var("zephyrproject/zephyr"), "ZEPHYR_DIR");
+/// ```
+pub fn git_name_to_dir_var(name: &str) -> String {
+    let component = name.rsplit('/').next().unwrap_or(name);
+    let upper = component.to_uppercase();
+    let sanitized = upper.replace(['-', '.'], "_");
+    format!("{}_DIR", sanitized)
+}
+
+/// Per-git Python virtual environment path: `<workspace>/.cim/<git-name>/.venv`.
+///
+/// Each git entry that declares `python-deps` gets its own isolated venv so
+/// that repositories needing conflicting versions of the same package can
+/// coexist in one workspace. The full git `name` (including any `/`) is used
+/// for the path so that nested names like `zephyrproject/zephyr` map to a
+/// stable, collision-free location.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// use dsdk_cli::workspace::git_venv_path;
+///
+/// let ws = Path::new("/ws");
+/// assert_eq!(git_venv_path(ws, "u-boot"), Path::new("/ws/.cim/u-boot/.venv"));
+/// assert_eq!(
+///     git_venv_path(ws, "zephyrproject/zephyr"),
+///     Path::new("/ws/.cim/zephyrproject/zephyr/.venv")
+/// );
+/// ```
+pub fn git_venv_path(workspace: &Path, git_name: &str) -> PathBuf {
+    workspace.join(".cim").join(git_name).join(".venv")
+}
+
+/// Convert a git entry name to its `_VENV` variable name.
+///
+/// Uses the same rules as [`git_name_to_dir_var`] (last path component,
+/// uppercased, hyphens and dots replaced with underscores) but appends
+/// `_VENV`. This variable points at [`git_venv_path`] and is emitted into the
+/// generated Makefile so `.mk` fragments can activate the right venv with
+/// `. $(ZEPHYR_VENV)/bin/activate`.
+///
+/// # Examples
+///
+/// ```
+/// use dsdk_cli::workspace::git_name_to_venv_var;
+///
+/// assert_eq!(git_name_to_venv_var("u-boot"), "U_BOOT_VENV");
+/// assert_eq!(git_name_to_venv_var("linux-stable"), "LINUX_STABLE_VENV");
+/// assert_eq!(git_name_to_venv_var("zephyrproject/zephyr"), "ZEPHYR_VENV");
+/// ```
+pub fn git_name_to_venv_var(name: &str) -> String {
+    let component = name.rsplit('/').next().unwrap_or(name);
+    let upper = component.to_uppercase();
+    let sanitized = upper.replace(['-', '.'], "_");
+    format!("{}_VENV", sanitized)
+}
+
+/// Generate auto-derived `_DIR` variables from git entries.
+///
+/// Returns a map of variable names (e.g., `U_BOOT_DIR`) to their raw values
+/// (e.g., `${{ WORKSPACE }}/u-boot`). The values use the `${{ WORKSPACE }}`
+/// placeholder so they can be expanded by [`expand_manifest_vars`] or rendered
+/// into Make syntax by `render_command_for_makefile`.
+///
+/// User-defined variables (from the `variables:` section) take precedence:
+/// if a user already defines `U_BOOT_DIR`, the auto-generated one is skipped.
+///
+/// Returns `Err` with a descriptive message if two git entries produce the
+/// same variable name (a naming conflict).
+pub fn generate_git_dir_vars(
+    gits: &[config::GitConfig],
+    user_vars: Option<&std::collections::HashMap<String, String>>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut dir_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for git in gits {
+        let var_name = git_name_to_dir_var(&git.name);
+
+        if let Some(uv) = user_vars {
+            if uv.contains_key(&var_name) {
+                continue;
+            }
+        }
+
+        if let Some(existing_value) = dir_vars.get(&var_name) {
+            let existing_name = existing_value
+                .strip_prefix("${{ WORKSPACE }}/")
+                .unwrap_or(existing_value);
+            return Err(format!(
+                "Git name conflict: '{}' and '{}' both produce variable '{}'. \
+                 Resolve by adding an explicit entry in the 'variables:' section.",
+                existing_name, git.name, var_name
+            ));
+        }
+
+        let value = format!("${{{{ WORKSPACE }}}}/{}", git.name);
+        dir_vars.insert(var_name, value);
+    }
+
+    Ok(dir_vars)
+}
+
+/// Generate auto-derived `_VENV` variables for git entries that declare
+/// `python-deps`.
+///
+/// Returns a map of variable names (e.g., `ZEPHYR_VENV`) to their raw values
+/// (e.g., `${{ WORKSPACE }}/.cim/zephyrproject/zephyr/.venv`). These point at
+/// the per-git virtual environment created by `cim install pip` so that
+/// generated Makefile fragments can activate the right venv with
+/// `. $(ZEPHYR_VENV)/bin/activate`.
+///
+/// Only gits with `python-deps` get a variable, to avoid cluttering the
+/// Makefile with venvs that are never created. User-defined variables take
+/// precedence, mirroring [`generate_git_dir_vars`]. Returns `Err` on a naming
+/// conflict between two git entries.
+pub fn generate_git_venv_vars(
+    gits: &[config::GitConfig],
+    user_vars: Option<&std::collections::HashMap<String, String>>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut venv_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for git in gits {
+        if git.python_deps.is_none() {
+            continue;
+        }
+
+        let var_name = git_name_to_venv_var(&git.name);
+
+        if let Some(uv) = user_vars {
+            if uv.contains_key(&var_name) {
+                continue;
+            }
+        }
+
+        if venv_vars.contains_key(&var_name) {
+            return Err(format!(
+                "Git name conflict: '{}' produces an already-used variable '{}'. \
+                 Resolve by adding an explicit entry in the 'variables:' section.",
+                git.name, var_name
+            ));
+        }
+
+        let value = format!("${{{{ WORKSPACE }}}}/.cim/{}/.venv", git.name);
+        venv_vars.insert(var_name, value);
+    }
+
+    Ok(venv_vars)
 }
 
 /// Expand `${{ VAR }}` manifest variable references in a string.
@@ -633,13 +986,75 @@ pub fn expand_manifest_vars(s: &str, vars: &std::collections::HashMap<String, St
     result
 }
 
+/// Load an SDK config from a workspace, resolving `extends:` locally.
+///
+/// If the primary sdk.yml at `config_path` has no `extends:`, this behaves
+/// exactly like `config::load_config`. Otherwise, it follows the chain of
+/// `<target>-sdk.yml` files that `cim init` already copied into the
+/// workspace's `.cim/target-overlays/` subfolder (no network access, no
+/// source re-fetch — consistent with `cim update`'s existing "never
+/// re-fetch from source" behavior), merging bottom-up via the overlay
+/// engine (each level's own `overlay:` key against its base), and validates
+/// dependency integrity once at the end.
+pub fn load_config_with_extends(
+    config_path: &Path,
+) -> Result<config::SdkConfig, Box<dyn std::error::Error>> {
+    let dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let primary = config::load_config(config_path)?;
+
+    if primary.extends.is_none() {
+        return Ok(primary);
+    }
+
+    let merged = resolve_local_extends_chain(dir, SDK_CONFIG_FILE, primary)?;
+    crate::overlay::validate_dependencies(&merged)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    Ok(merged)
+}
+
+/// Recursively resolve `extends:` for a single already-loaded config,
+/// looking up ancestor files by naming convention under `dir`'s
+/// `.cim/target-overlays/` subfolder.
+fn resolve_local_extends_chain(
+    dir: &Path,
+    sdk_file_name: &str,
+    derived: config::SdkConfig,
+) -> Result<config::SdkConfig, Box<dyn std::error::Error>> {
+    let Some(extends) = derived.extends.clone() else {
+        return Ok(derived);
+    };
+
+    let overlays_dir = dir.join(OVERLAYS_DIR);
+    let base_sdk_name = format!("{}-{}", extends.target, SDK_CONFIG_FILE);
+    let base_sdk_path = overlays_dir.join(&base_sdk_name);
+    if !base_sdk_path.exists() {
+        return Err(format!(
+            "extends: base target '{}' declared in {} but {} not found in {}. \
+             Re-run 'cim init', or copy the file in manually.",
+            extends.target,
+            sdk_file_name,
+            base_sdk_name,
+            overlays_dir.display()
+        )
+        .into());
+    }
+
+    let base_derived = config::load_config(&base_sdk_path)?;
+    let base_merged = resolve_local_extends_chain(dir, &base_sdk_name, base_derived)?;
+
+    let overlay_config = derived.overlay.clone().unwrap_or_default();
+
+    crate::overlay::apply_overlay(base_merged, derived, &overlay_config)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })
+}
+
 /// Load SDK config from a path and apply user config overrides if available
 ///
 /// This function encapsulates the common pattern of:
 /// 1. Loading SDK config from sdk.yml
 /// 2. Loading user config
 /// 3. Applying user config overrides to SDK config
-/// 4. Expanding environment variables in mirror path
+/// 4. Expanding environment variables in git repository URLs and manifest vars
 ///
 /// # Arguments
 ///
@@ -648,13 +1063,13 @@ pub fn expand_manifest_vars(s: &str, vars: &std::collections::HashMap<String, St
 ///
 /// # Returns
 ///
-/// Result containing the SdkConfig with user overrides applied and mirror path expanded
+/// Result containing the SdkConfig with user overrides applied
 pub fn load_config_with_user_overrides(
     config_path: &Path,
     verbose: bool,
 ) -> Result<config::SdkConfig, Box<dyn std::error::Error>> {
-    // Load SDK config
-    let mut sdk_config = config::load_config(config_path)?;
+    // Load SDK config, resolving extends: locally if present
+    let mut sdk_config = load_config_with_extends(config_path)?;
 
     // Load and apply user config overrides if present
     match config::UserConfig::load() {
@@ -683,18 +1098,6 @@ pub fn load_config_with_user_overrides(
         }
     }
 
-    // Expand environment variables in mirror path
-    let original_mirror = sdk_config.mirror.to_string_lossy().to_string();
-    let expanded_mirror = expand_config_mirror_path(&sdk_config);
-    if verbose && original_mirror != expanded_mirror.to_string_lossy() {
-        messages::verbose(&format!(
-            "Expanded mirror: {} -> {}",
-            original_mirror,
-            expanded_mirror.display()
-        ));
-    }
-    sdk_config.mirror = expanded_mirror;
-
     // Expand environment variables in git repository URLs
     for git in &mut sdk_config.gits {
         let expanded = expand_env_vars(&git.url);
@@ -707,49 +1110,77 @@ pub fn load_config_with_user_overrides(
     }
 
     // Expand manifest ${{ VAR }} variables in path/URL fields
-    if let Some(raw_vars) = sdk_config.variables.clone() {
-        let vars = resolve_variables(&raw_vars);
-
-        // Expand in git URLs
-        for git in &mut sdk_config.gits {
-            git.url = expand_manifest_vars(&git.url, &vars);
-        }
-
-        // Expand in toolchain URL and destination
-        if let Some(ref mut toolchains) = sdk_config.toolchains {
-            for tc in toolchains.iter_mut() {
-                if let Some(ref name) = tc.name.clone() {
-                    tc.name = Some(expand_manifest_vars(name, &vars));
-                }
-                tc.url = expand_manifest_vars(&tc.url.clone(), &vars);
-                tc.destination = expand_manifest_vars(&tc.destination.clone(), &vars);
-                if let Some(ref md) = tc.mirror_destination.clone() {
-                    tc.mirror_destination = Some(expand_manifest_vars(md, &vars));
-                }
-            }
-        }
-
-        // Expand in copy_files source and dest
-        if let Some(ref mut copy_files) = sdk_config.copy_files {
-            for cf in copy_files.iter_mut() {
-                cf.source = expand_manifest_vars(&cf.source.clone(), &vars);
-                cf.dest = expand_manifest_vars(&cf.dest.clone(), &vars);
-            }
-        }
-    }
+    expand_manifest_vars_in_config(&mut sdk_config);
 
     Ok(sdk_config)
 }
 
-/// Expand environment variables in the mirror path of a config
+/// Expand `${{ VAR }}` manifest variables in all relevant fields of an SdkConfig.
 ///
-/// This function takes a config and returns a new PathBuf with environment variables
-/// expanded in the mirror path. This is needed because the YAML parser treats
-/// $HOME and similar variables as literal strings. Used by init and update commands.
-pub fn expand_config_mirror_path<T: config::SdkConfigCore>(config: &T) -> PathBuf {
-    let mirror_str = config.mirror().to_string_lossy();
-    let expanded = expand_env_vars(&mirror_str);
-    PathBuf::from(expanded)
+/// Expands variables in git URLs, toolchain URLs/destinations/names, and
+/// copy_files source/dest fields. The expansion context includes both
+/// user-defined variables from the `variables:` section and auto-generated
+/// `_DIR` variables derived from git entry names.
+pub fn expand_manifest_vars_in_config(sdk_config: &mut config::SdkConfig) {
+    let mut vars = if let Some(ref raw_vars) = sdk_config.variables {
+        resolve_variables(raw_vars)
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Merge auto-generated DIR vars (user-defined take precedence)
+    if let Ok(dir_vars) = generate_git_dir_vars(&sdk_config.gits, sdk_config.variables.as_ref()) {
+        for (k, v) in dir_vars {
+            vars.entry(k).or_insert(v);
+        }
+    }
+
+    if vars.is_empty() {
+        return;
+    }
+
+    for git in &mut sdk_config.gits {
+        git.url = expand_manifest_vars(&git.url, &vars);
+    }
+
+    if let Some(ref mut toolchains) = sdk_config.toolchains {
+        for tc in toolchains.iter_mut() {
+            if let Some(ref name) = tc.name.clone() {
+                tc.name = Some(expand_manifest_vars(name, &vars));
+            }
+            tc.url = expand_manifest_vars(&tc.url.clone(), &vars);
+            tc.destination = expand_manifest_vars(&tc.destination.clone(), &vars);
+            if let Some(ref md) = tc.mirror_destination.clone() {
+                tc.mirror_destination = Some(expand_manifest_vars(md, &vars));
+            }
+        }
+    }
+
+    if let Some(ref mut copy_files) = sdk_config.copy_files {
+        for cf in copy_files.iter_mut() {
+            cf.source = expand_manifest_vars(&cf.source.clone(), &vars);
+            cf.dest = expand_manifest_vars(&cf.dest.clone(), &vars);
+        }
+    }
+}
+
+/// Resolve the effective mirror cache directory, highest priority first:
+///
+/// 1. `cli_override` — the `--mirror` flag passed to `init` / `update`.
+/// 2. `mirror` in `~/.config/cim/config.toml` (the user config).
+/// 3. The built-in default, `config::default_mirror()` (`$HOME/tmp/mirror`).
+///
+/// Environment variables (e.g. `$HOME`) in the chosen value are expanded.
+pub fn resolve_mirror(cli_override: Option<&Path>) -> PathBuf {
+    let raw = if let Some(cli) = cli_override {
+        cli.to_path_buf()
+    } else if let Ok(Some(user_config)) = config::UserConfig::load() {
+        user_config.mirror.unwrap_or_else(config::default_mirror)
+    } else {
+        config::default_mirror()
+    };
+
+    PathBuf::from(expand_env_vars(&raw.to_string_lossy()))
 }
 
 /// Download a file from URL to a temporary location
@@ -781,6 +1212,89 @@ pub fn download_config_from_url(url: &str) -> Result<PathBuf, Box<dyn std::error
     Ok(temp_file_path)
 }
 
+/// Insert a YAML list entry at the end of a top-level section in a YAML document.
+///
+/// Preserves the original formatting and comments. The `section_key` should be a
+/// top-level key (e.g., "gits"). The `entry` should be the pre-formatted YAML text
+/// to insert (including any leading newline if desired).
+///
+/// Returns `Ok(modified_content)` or `Err(message)` if the section is not found.
+pub fn insert_yaml_section_entry(
+    content: &str,
+    section_key: &str,
+    entry: &str,
+) -> Result<String, String> {
+    let key_pattern = format!("{}:", section_key);
+    let Some(section_pos) = content.find(&key_pattern) else {
+        return Err(format!(
+            "Could not find '{}:' section in YAML content",
+            section_key
+        ));
+    };
+
+    let line_end = content[section_pos..]
+        .find('\n')
+        .map(|pos| section_pos + pos)
+        .unwrap_or(content.len());
+    let section_line = &content[section_pos..line_end];
+
+    // Handle empty array syntax (e.g., "gits: []")
+    if section_line.contains("[]") {
+        let replacement = format!("{}:{}", section_key, entry);
+        return Ok(format!(
+            "{}{}{}",
+            &content[..section_pos],
+            replacement,
+            &content[line_end..]
+        ));
+    }
+
+    // Find the end of the section by scanning line by line.
+    // Only a real YAML key at column 0 (non-whitespace, non-comment) ends the section.
+    let key_line_len = content[section_pos..]
+        .find('\n')
+        .map(|p| p + 1)
+        .unwrap_or(content.len() - section_pos);
+
+    let mut insert_pos = section_pos + key_line_len;
+    let mut scan_pos = section_pos + key_line_len;
+
+    while scan_pos < content.len() {
+        let line_end = content[scan_pos..]
+            .find('\n')
+            .map(|p| scan_pos + p + 1)
+            .unwrap_or(content.len());
+
+        let line = &content[scan_pos..line_end];
+        let first_byte = line.bytes().next();
+
+        match first_byte {
+            None | Some(b'\n') | Some(b'\r') => {
+                // Empty line — skip
+            }
+            Some(b' ') | Some(b'\t') => {
+                // Indented line → belongs to the current section; advance insert_pos
+                insert_pos = line_end;
+            }
+            Some(b'#') => {
+                // Comment line → skip; belongs to the next section
+            }
+            _ => {
+                // Non-indented, non-comment line = start of the next YAML key
+                break;
+            }
+        }
+        scan_pos = line_end;
+    }
+
+    Ok(format!(
+        "{}{}{}",
+        &content[..insert_pos],
+        entry,
+        &content[insert_pos..]
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,6 +1306,100 @@ mod tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let workspace_path = temp_dir.path().to_path_buf();
         (temp_dir, workspace_path)
+    }
+
+    #[test]
+    fn test_discover_dependency_files_none_present() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+        assert!(discover_dependency_files(&workspace_path, OS_DEPS_FILE).is_empty());
+    }
+
+    #[test]
+    fn test_discover_dependency_files_bare_only() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+        fs::write(workspace_path.join(OS_DEPS_FILE), "linux: {}\n").unwrap();
+
+        let found = discover_dependency_files(&workspace_path, OS_DEPS_FILE);
+        assert_eq!(found, vec![workspace_path.join(OS_DEPS_FILE)]);
+    }
+
+    #[test]
+    fn test_discover_dependency_files_bare_and_ancestor() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+        fs::write(workspace_path.join(OS_DEPS_FILE), "linux: {}\n").unwrap();
+        let overlays_dir = workspace_path.join(OVERLAYS_DIR);
+        fs::create_dir_all(&overlays_dir).unwrap();
+        fs::write(
+            overlays_dir.join("example-os-dependencies.yml"),
+            "linux: {}\n",
+        )
+        .unwrap();
+        // Unrelated file that happens to end with a similar suffix should
+        // not be picked up.
+        fs::write(overlays_dir.join("not-related.yml"), "linux: {}\n").unwrap();
+
+        let found = discover_dependency_files(&workspace_path, OS_DEPS_FILE);
+        assert_eq!(
+            found,
+            vec![
+                workspace_path.join(OS_DEPS_FILE),
+                overlays_dir.join("example-os-dependencies.yml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_discover_dependency_files_ancestor_only_no_bare() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+        let overlays_dir = workspace_path.join(OVERLAYS_DIR);
+        fs::create_dir_all(&overlays_dir).unwrap();
+        fs::write(
+            overlays_dir.join("platform-sdk-python-dependencies.yml"),
+            "profiles: {}\ndefault: docs\n",
+        )
+        .unwrap();
+
+        let found = discover_dependency_files(&workspace_path, PYTHON_DEPS_FILE);
+        assert_eq!(
+            found,
+            vec![overlays_dir.join("platform-sdk-python-dependencies.yml")]
+        );
+    }
+
+    #[test]
+    fn test_load_config_with_extends_reads_ancestor_from_overlays_dir() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+        fs::write(
+            workspace_path.join(SDK_CONFIG_FILE),
+            "extends: base-sdk\ngits: []\n",
+        )
+        .unwrap();
+        let overlays_dir = workspace_path.join(OVERLAYS_DIR);
+        fs::create_dir_all(&overlays_dir).unwrap();
+        fs::write(
+            overlays_dir.join("base-sdk-sdk.yml"),
+            "gits:\n  - name: base-repo\n    url: https://example.com/base.git\n    commit: main\n",
+        )
+        .unwrap();
+
+        let config_path = workspace_path.join(SDK_CONFIG_FILE);
+        let merged = load_config_with_extends(&config_path).expect("should resolve extends chain");
+        assert_eq!(merged.gits.len(), 1);
+        assert_eq!(merged.gits[0].name, "base-repo");
+    }
+
+    #[test]
+    fn test_load_config_with_extends_missing_ancestor_mentions_overlays_dir() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+        fs::write(
+            workspace_path.join(SDK_CONFIG_FILE),
+            "extends: base-sdk\ngits: []\n",
+        )
+        .unwrap();
+
+        let config_path = workspace_path.join(SDK_CONFIG_FILE);
+        let err = load_config_with_extends(&config_path).unwrap_err();
+        assert!(err.to_string().contains(OVERLAYS_DIR));
     }
 
     #[test]
@@ -810,11 +1418,14 @@ mod tests {
             cim_commit: "6b4768b7".to_string(),
             no_mirror: Some(true),
             config_source_dir: Some("/path/to/source".to_string()),
+            match_pattern: None,
+            include_groups: None,
+            exclude_groups: None,
         };
 
-        let serialized = serde_yaml::to_string(&marker).expect("Failed to serialize marker");
+        let serialized = noyalib::to_string(&marker).expect("Failed to serialize marker");
         let deserialized: WorkspaceMarker =
-            serde_yaml::from_str(&serialized).expect("Failed to deserialize marker");
+            noyalib::from_str(&serialized).expect("Failed to deserialize marker");
 
         assert_eq!(marker.workspace_version, deserialized.workspace_version);
         assert_eq!(marker.created_at, deserialized.created_at);
@@ -840,7 +1451,7 @@ mod tests {
         let test_config_content = "test: config\ndata: value";
         fs::write(&original_config_path, test_config_content).expect("Failed to write test config");
 
-        let config_name = "sdk.yml";
+        let config_name = SDK_CONFIG_FILE;
         let mirror_path = Path::new("/tmp/test-mirror");
 
         let result = create_workspace_marker(CreateWorkspaceMarkerParams {
@@ -852,15 +1463,18 @@ mod tests {
             target_version: None,
             skip_mirror: false,
             source_url: None,
+            match_pattern: None,
+            include_group: None,
+            exclude_group: None,
         });
         assert!(result.is_ok());
 
-        let marker_path = workspace_path.join(".workspace");
+        let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
         assert!(marker_path.exists());
 
         let marker_content = fs::read_to_string(&marker_path).expect("Failed to read marker");
         let marker: WorkspaceMarker =
-            serde_yaml::from_str(&marker_content).expect("Failed to parse marker");
+            noyalib::from_str(&marker_content).expect("Failed to parse marker");
 
         assert_eq!(marker.workspace_version, "1");
         assert_eq!(marker.config_file, config_name);
@@ -968,27 +1582,12 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_config_mirror_path() {
-        // Create a test config with environment variable in mirror path
+    fn test_resolve_mirror_cli_override_is_expanded() {
+        // A --mirror override containing an environment variable is expanded.
         std::env::set_var("TEST_MIRROR_VAR", "/tmp/test-mirror");
 
-        let test_config = config::SdkConfig {
-            makefile_include: None,
-            envsetup: None,
-            test: None,
-            clean: None,
-            build: None,
-            flash: None,
-            variables: None,
-            toolchains: None,
-            install: None,
-            copy_files: None,
-            mirror: PathBuf::from("$TEST_MIRROR_VAR/repos"),
-            gits: vec![],
-        };
-
-        let expanded = expand_config_mirror_path(&test_config);
-        assert_eq!(expanded, PathBuf::from("/tmp/test-mirror/repos"));
+        let resolved = resolve_mirror(Some(Path::new("$TEST_MIRROR_VAR/repos")));
+        assert_eq!(resolved, PathBuf::from("/tmp/test-mirror/repos"));
 
         // Cleanup
         std::env::remove_var("TEST_MIRROR_VAR");
@@ -1027,6 +1626,60 @@ mod tests {
         assert_eq!(
             expand_manifest_vars("path/${{ UNKNOWN }}/file", &vars),
             "path/${{ UNKNOWN }}/file"
+        );
+    }
+
+    #[test]
+    fn test_has_unresolved_env_var_refs_no_dollar() {
+        assert!(!has_unresolved_env_var_refs("https://example.com/sdk"));
+        assert!(!has_unresolved_env_var_refs(""));
+        assert!(!has_unresolved_env_var_refs("plain-value"));
+    }
+
+    #[test]
+    fn test_has_unresolved_env_var_refs_manifest_pattern_only() {
+        // ${{ VAR }} patterns are intentional Make references — not unresolved.
+        assert!(!has_unresolved_env_var_refs("${{ WORKSPACE }}/bin"));
+        assert!(!has_unresolved_env_var_refs("${{ A }}/${{ B }}"));
+        assert!(!has_unresolved_env_var_refs(
+            "prefix/${{ WORKSPACE }}/suffix"
+        ));
+    }
+
+    #[test]
+    fn test_has_unresolved_env_var_refs_bare_dollar() {
+        // A bare $VAR or ${VAR} that was not expanded is a real warning case.
+        assert!(has_unresolved_env_var_refs("$UNSET_HOST_VAR/path"));
+        assert!(has_unresolved_env_var_refs("${UNSET_VAR}/path"));
+    }
+
+    #[test]
+    fn test_has_unresolved_env_var_refs_mixed() {
+        // A mix: the ${{ }} part is fine, but the bare $UNSET is a real warning.
+        assert!(has_unresolved_env_var_refs("${{ WORKSPACE }}/$UNSET"));
+    }
+
+    #[test]
+    fn test_resolve_variables_manifest_ref_passes_through() {
+        // ${{ WORKSPACE }} must survive resolve_variables unchanged so that
+        // Makefile generation can convert it to $(WORKSPACE) later.
+        let mut raw = std::collections::HashMap::new();
+        raw.insert(
+            "TOOLCHAIN_PATH".to_string(),
+            "${{ WORKSPACE }}/toolchains/bin".to_string(),
+        );
+        raw.insert("PLAIN".to_string(), "no-dollar-here".to_string());
+
+        let resolved = resolve_variables(&raw);
+
+        assert_eq!(
+            resolved.get("TOOLCHAIN_PATH").map(String::as_str),
+            Some("${{ WORKSPACE }}/toolchains/bin"),
+            "Manifest variable reference should pass through resolve_variables unchanged"
+        );
+        assert_eq!(
+            resolved.get("PLAIN").map(String::as_str),
+            Some("no-dollar-here")
         );
     }
 
@@ -1122,5 +1775,287 @@ mod tests {
             .join(format!("dsdk-{}", target));
         let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
         assert_eq!(result, PathBuf::from(home).join("dsdk-test-target"));
+    }
+
+    #[test]
+    fn test_insert_yaml_section_entry_appends_to_existing() {
+        let content = "name: test\ngits:\n  - name: repo1\n    url: http://a\n    commit: abc\nother_key: val\n";
+        let entry = "\n  - name: repo2\n    url: http://b\n    commit: def";
+        let result = insert_yaml_section_entry(content, "gits", entry).unwrap();
+        assert!(result.contains("repo1"));
+        assert!(result.contains("repo2"));
+        assert!(result.contains("other_key: val"));
+        // repo2 should appear after repo1 and before other_key
+        let pos_repo2 = result.find("repo2").unwrap();
+        let pos_other = result.find("other_key").unwrap();
+        assert!(pos_repo2 < pos_other);
+    }
+
+    #[test]
+    fn test_insert_yaml_section_entry_empty_array() {
+        let content = "name: test\ngits: []\nother_key: val\n";
+        let entry = "\n  - name: repo1\n    url: http://a\n    commit: abc";
+        let result = insert_yaml_section_entry(content, "gits", entry).unwrap();
+        assert!(result.contains("gits:"));
+        assert!(!result.contains("[]"));
+        assert!(result.contains("repo1"));
+        assert!(result.contains("other_key: val"));
+    }
+
+    #[test]
+    fn test_insert_yaml_section_entry_missing_section() {
+        let content = "name: test\nother: val\n";
+        let entry = "\n  - name: repo1";
+        let result = insert_yaml_section_entry(content, "gits", entry);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Could not find"));
+    }
+
+    #[test]
+    fn test_insert_yaml_section_entry_at_end_of_file() {
+        let content = "name: test\ngits:\n  - name: repo1\n    url: http://a\n    commit: abc\n";
+        let entry = "\n  - name: repo2\n    url: http://b\n    commit: def";
+        let result = insert_yaml_section_entry(content, "gits", entry).unwrap();
+        assert!(result.contains("repo2"));
+        // Should end with the entry (no trailing section to preserve)
+        assert!(result.ends_with("def"));
+    }
+
+    #[test]
+    fn test_git_name_to_dir_var_simple() {
+        assert_eq!(git_name_to_dir_var("u-boot"), "U_BOOT_DIR");
+        assert_eq!(git_name_to_dir_var("linux-stable"), "LINUX_STABLE_DIR");
+        assert_eq!(git_name_to_dir_var("optee_os"), "OPTEE_OS_DIR");
+    }
+
+    #[test]
+    fn test_git_name_to_dir_var_with_path() {
+        assert_eq!(git_name_to_dir_var("zephyrproject/zephyr"), "ZEPHYR_DIR");
+        assert_eq!(git_name_to_dir_var("foo/bar/baz"), "BAZ_DIR");
+    }
+
+    #[test]
+    fn test_git_name_to_dir_var_with_dots() {
+        assert_eq!(git_name_to_dir_var("my.project"), "MY_PROJECT_DIR");
+        assert_eq!(git_name_to_dir_var("v2.0-release"), "V2_0_RELEASE_DIR");
+    }
+
+    #[test]
+    fn test_git_name_to_venv_var() {
+        assert_eq!(git_name_to_venv_var("u-boot"), "U_BOOT_VENV");
+        assert_eq!(git_name_to_venv_var("linux-stable"), "LINUX_STABLE_VENV");
+        assert_eq!(git_name_to_venv_var("optee_os"), "OPTEE_OS_VENV");
+        assert_eq!(git_name_to_venv_var("zephyrproject/zephyr"), "ZEPHYR_VENV");
+        assert_eq!(git_name_to_venv_var("v2.0-release"), "V2_0_RELEASE_VENV");
+    }
+
+    #[test]
+    fn test_git_venv_path() {
+        let ws = Path::new("/ws");
+        assert_eq!(
+            git_venv_path(ws, "u-boot"),
+            Path::new("/ws/.cim/u-boot/.venv")
+        );
+        assert_eq!(
+            git_venv_path(ws, "zephyrproject/zephyr"),
+            Path::new("/ws/.cim/zephyrproject/zephyr/.venv")
+        );
+    }
+
+    #[test]
+    fn test_generate_git_dir_vars_basic() {
+        let gits = vec![
+            config::GitConfig {
+                name: "u-boot".to_string(),
+                url: "https://example.com/u-boot.git".to_string(),
+                commit: "master".to_string(),
+                ..Default::default()
+            },
+            config::GitConfig {
+                name: "linux-stable".to_string(),
+                url: "https://example.com/linux.git".to_string(),
+                commit: "v6.1".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let result = generate_git_dir_vars(&gits, None).unwrap();
+        assert_eq!(result.get("U_BOOT_DIR").unwrap(), "${{ WORKSPACE }}/u-boot");
+        assert_eq!(
+            result.get("LINUX_STABLE_DIR").unwrap(),
+            "${{ WORKSPACE }}/linux-stable"
+        );
+    }
+
+    #[test]
+    fn test_generate_git_dir_vars_conflict() {
+        let gits = vec![
+            config::GitConfig {
+                name: "foo/zephyr".to_string(),
+                url: "https://example.com/foo/zephyr.git".to_string(),
+                commit: "main".to_string(),
+                ..Default::default()
+            },
+            config::GitConfig {
+                name: "bar/zephyr".to_string(),
+                url: "https://example.com/bar/zephyr.git".to_string(),
+                commit: "main".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let result = generate_git_dir_vars(&gits, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("foo/zephyr"));
+        assert!(err.contains("bar/zephyr"));
+        assert!(err.contains("ZEPHYR_DIR"));
+    }
+
+    #[test]
+    fn test_generate_git_venv_vars_only_for_python_deps() {
+        let gits = vec![
+            config::GitConfig {
+                name: "zephyrproject/zephyr".to_string(),
+                url: "https://example.com/zephyr.git".to_string(),
+                commit: "main".to_string(),
+                python_deps: Some(vec!["zephyrproject/zephyr/requirements.txt".to_string()]),
+                ..Default::default()
+            },
+            config::GitConfig {
+                name: "u-boot".to_string(),
+                url: "https://example.com/u-boot.git".to_string(),
+                commit: "master".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let result = generate_git_venv_vars(&gits, None).unwrap();
+        // Only the git with python-deps gets a venv variable.
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.get("ZEPHYR_VENV").unwrap(),
+            "${{ WORKSPACE }}/.cim/zephyrproject/zephyr/.venv"
+        );
+        assert!(!result.contains_key("U_BOOT_VENV"));
+    }
+
+    #[test]
+    fn test_generate_git_venv_vars_user_override() {
+        let gits = vec![config::GitConfig {
+            name: "zephyr".to_string(),
+            url: "https://example.com/zephyr.git".to_string(),
+            commit: "main".to_string(),
+            python_deps: Some(vec!["zephyr/requirements.txt".to_string()]),
+            ..Default::default()
+        }];
+
+        let mut user_vars = std::collections::HashMap::new();
+        user_vars.insert("ZEPHYR_VENV".to_string(), "/custom/venv".to_string());
+
+        // User-defined variable wins: no auto-generated entry.
+        let result = generate_git_venv_vars(&gits, Some(&user_vars)).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_generate_git_dir_vars_user_override() {
+        let gits = vec![config::GitConfig {
+            name: "u-boot".to_string(),
+            url: "https://example.com/u-boot.git".to_string(),
+            commit: "master".to_string(),
+            ..Default::default()
+        }];
+
+        let mut user_vars = std::collections::HashMap::new();
+        user_vars.insert(
+            "U_BOOT_DIR".to_string(),
+            "${{ WORKSPACE }}/custom/u-boot".to_string(),
+        );
+
+        let result = generate_git_dir_vars(&gits, Some(&user_vars)).unwrap();
+        assert!(!result.contains_key("U_BOOT_DIR"));
+    }
+
+    #[test]
+    fn test_is_url_http() {
+        assert!(is_url("http://example.com/manifests"));
+    }
+
+    #[test]
+    fn test_is_url_https() {
+        assert!(is_url("https://github.com/org/repo.git"));
+    }
+
+    #[test]
+    fn test_is_url_ssh() {
+        assert!(is_url("git@github.com:org/repo.git"));
+    }
+
+    #[test]
+    fn test_is_url_local_path() {
+        assert!(!is_url("/home/user/manifests"));
+        assert!(!is_url("./relative/path"));
+        assert!(!is_url("manifests"));
+    }
+
+    #[test]
+    fn test_get_all_sources_from_config_default_only() {
+        let uc = config::UserConfig {
+            default_source: Some("/my/source".to_string()),
+            alternate_sources: None,
+            ..Default::default()
+        };
+        let sources = get_all_sources_from_config(Some(&uc));
+        assert_eq!(sources, vec!["/my/source"]);
+    }
+
+    fn alt(url: &str) -> config::AlternateSourceConfig {
+        config::AlternateSourceConfig {
+            url: url.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_get_all_sources_from_config_with_alternates() {
+        let uc = config::UserConfig {
+            default_source: Some("/default".to_string()),
+            alternate_sources: Some(vec![alt("/alt1"), alt("/alt2")]),
+            ..Default::default()
+        };
+        let sources = get_all_sources_from_config(Some(&uc));
+        assert_eq!(sources, vec!["/default", "/alt1", "/alt2"]);
+    }
+
+    #[test]
+    fn test_get_all_sources_from_config_dedup() {
+        let uc = config::UserConfig {
+            default_source: Some("/default".to_string()),
+            alternate_sources: Some(vec![
+                alt("/default"), // duplicate of default
+                alt("/alt1"),
+            ]),
+            ..Default::default()
+        };
+        let sources = get_all_sources_from_config(Some(&uc));
+        assert_eq!(sources, vec!["/default", "/alt1"]);
+    }
+
+    #[test]
+    fn test_get_all_sources_from_config_filters_empty() {
+        let uc = config::UserConfig {
+            default_source: Some("/default".to_string()),
+            alternate_sources: Some(vec![alt(""), alt("   "), alt("/valid")]),
+            ..Default::default()
+        };
+        let sources = get_all_sources_from_config(Some(&uc));
+        assert_eq!(sources, vec!["/default", "/valid"]);
+    }
+
+    #[test]
+    fn test_get_all_sources_from_config_no_config() {
+        let sources = get_all_sources_from_config(None);
+        // Should return the hardcoded fallback path
+        assert_eq!(sources.len(), 1);
     }
 }

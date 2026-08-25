@@ -11,24 +11,22 @@
 
 use crate::cli::{Cli, DockerCommand};
 use crate::init_cmd::{
-    compile_match_regex, create_filtered_sdk_config, filter_git_configs,
-    get_latest_commit_for_branch, is_branch_reference, list_available_targets,
-    list_target_versions, list_targets_from_source, resolve_target_config,
+    compile_match_regex, create_filtered_sdk_config, get_latest_commit_for_branch,
+    get_latest_commit_for_branch_with_remote, is_branch_reference, list_target_versions,
+    list_targets_from_source, parse_group_list, setup_direnv, source_label,
 };
 use crate::version::{print_update_notice, spawn_version_check};
 use clap::CommandFactory;
+use dsdk_cli::config::SdkConfigCore;
 use dsdk_cli::workspace::{
-    expand_config_mirror_path, get_current_workspace, get_default_source, get_docker_temp_dir,
-    is_url, resolve_target_config_from_git, WorkspaceMarker,
+    get_all_sources, load_config_with_extends, require_workspace_config, resolve_mirror,
+    WorkspaceMarker, WORKSPACE_MARKER_FILE,
 };
 use dsdk_cli::{config, docker_manager, git_operations, messages};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 use threadpool::ThreadPool;
 
 /// Configuration command options
@@ -243,72 +241,132 @@ fn create_config_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Handle the list-targets command
 pub(crate) fn handle_list_targets_command(source: Option<&str>, target_filter: Option<&str>) {
-    let default_source = get_default_source();
-    let (source_path, using_user_default) = if let Some(src) = source {
-        (src.to_string(), false)
-    } else {
-        // Check if using user config default
-        let using_default = if let Ok(Some(uc)) = config::UserConfig::load() {
-            uc.default_source.is_some()
-        } else {
-            false
-        };
-        (default_source, using_default)
-    };
-
-    if let Some(target_name) = target_filter {
-        // List versions for specific target
-        match list_target_versions(&source_path, target_name) {
-            Ok(versions) => {
-                if versions.is_empty() {
-                    messages::status(&format!("No versions found for target '{}'", target_name));
-                } else {
-                    if using_user_default {
-                        messages::status(&format!("Available versions for target '{}' (using default_source from user config):", target_name));
-                        messages::status(&format!("  Source: {}", source_path));
-                    } else {
+    // If --source is explicitly given, use only that single source (no alternates)
+    if let Some(src) = source {
+        let source_path = src.to_string();
+        if let Some(target_name) = target_filter {
+            match list_target_versions(&source_path, target_name) {
+                Ok(versions) => {
+                    if versions.is_empty() {
                         messages::status(&format!(
-                            "Available versions for target '{}':",
+                            "No versions found for target '{}'",
                             target_name
                         ));
-                    }
-                    for version in versions {
-                        messages::status(&format!("  - {}", version));
+                    } else {
+                        messages::status(&format!(
+                            "Available versions for target '{}' from {}:",
+                            target_name, source_path
+                        ));
+                        for version in versions {
+                            messages::status(&format!("  - {}", version));
+                        }
                     }
                 }
+                Err(e) => {
+                    messages::error(&format!(
+                        "Error listing versions for target '{}': {}",
+                        target_name, e
+                    ));
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                messages::error(&format!(
-                    "Error listing versions for target '{}': {}",
-                    target_name, e
-                ));
-                std::process::exit(1);
-            }
-        }
-    } else {
-        // List all available targets
-        match list_targets_from_source(&source_path) {
-            Ok(targets) => {
-                if targets.is_empty() {
-                    messages::status(&format!("No targets found in {}", source_path));
-                } else {
-                    if using_user_default {
-                        messages::status(&format!(
-                            "Available targets from {} (user config default_source):",
-                            source_path
-                        ));
+        } else {
+            match list_targets_from_source(&source_path) {
+                Ok(targets) => {
+                    if targets.is_empty() {
+                        messages::status(&format!("No targets found in {}", source_path));
                     } else {
                         messages::status(&format!("Available targets from {}:", source_path));
+                        for target in targets {
+                            messages::status(&format!("  - {}", target));
+                        }
                     }
-                    for target in targets {
-                        messages::status(&format!("  - {}", target));
+                }
+                Err(e) => {
+                    messages::error(&format!("Error listing targets: {}", e));
+                    std::process::exit(1);
+                }
+            }
+        }
+        return;
+    }
+
+    // No --source: use all configured sources (default + alternates)
+    let sources = get_all_sources();
+    let has_alternates = sources.len() > 1;
+
+    if let Some(target_name) = target_filter {
+        let mut any_versions = false;
+        for (i, source_path) in sources.iter().enumerate() {
+            match list_target_versions(source_path, target_name) {
+                Ok(versions) => {
+                    if !versions.is_empty() {
+                        any_versions = true;
+                        if has_alternates {
+                            messages::status(&format!(
+                                "  Source: {} ({})",
+                                source_path,
+                                source_label(i)
+                            ));
+                        } else {
+                            messages::status(&format!("  Source: {}", source_path));
+                        }
+                        for version in versions {
+                            messages::status(&format!("    - {}", version));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if has_alternates {
+                        messages::verbose(&format!("  Skipping {} (error: {})", source_path, e));
+                    } else {
+                        messages::error(&format!(
+                            "Error listing versions for target '{}': {}",
+                            target_name, e
+                        ));
+                        std::process::exit(1);
                     }
                 }
             }
-            Err(e) => {
-                messages::error(&format!("Error listing targets: {}", e));
-                std::process::exit(1);
+        }
+        if !any_versions {
+            messages::status(&format!("No versions found for target '{}'", target_name));
+        }
+    } else {
+        let mut any_targets = false;
+        for (i, source_path) in sources.iter().enumerate() {
+            match list_targets_from_source(source_path) {
+                Ok(targets) => {
+                    if !targets.is_empty() {
+                        any_targets = true;
+                        if has_alternates {
+                            messages::status(&format!(
+                                "  Source: {} ({})",
+                                source_path,
+                                source_label(i)
+                            ));
+                        } else {
+                            messages::status(&format!("Available targets from {}:", source_path));
+                        }
+                        for target in targets {
+                            messages::status(&format!("    - {}", target));
+                        }
+                    } else if !has_alternates {
+                        messages::status(&format!("No targets found in {}", source_path));
+                    }
+                }
+                Err(e) => {
+                    if has_alternates {
+                        messages::verbose(&format!("  Skipping {} (error: {})", source_path, e));
+                    } else {
+                        messages::error(&format!("Error listing targets: {}", e));
+                        std::process::exit(1);
+                    }
+                }
             }
+        }
+        if !any_targets {
+            messages::status("No targets found in any configured manifest source");
         }
     }
 }
@@ -316,9 +374,14 @@ pub(crate) fn handle_list_targets_command(source: Option<&str>, target_filter: O
 /// Update all git repositories in the mirror and workspace
 ///
 /// Supports environment variable expansion in mirror paths (e.g., $HOME, ${HOME})
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_update_command(
     no_mirror: bool,
+    mirror_override: Option<PathBuf>,
     match_pattern: Option<&str>,
+    include_group: Option<&str>,
+    exclude_group: Option<&str>,
+    all: bool,
     verbose: bool,
     _cert_validation: Option<&str>,
 ) {
@@ -328,9 +391,8 @@ pub(crate) fn handle_update_command(
     // Set verbose mode for this command
     messages::set_verbose(verbose);
 
-    // Must be run from within a workspace
-    let workspace_path = match get_current_workspace() {
-        Ok(path) => path,
+    let (workspace_path, config_path) = match require_workspace_config() {
+        Ok(paths) => paths,
         Err(e) => {
             messages::error(&e);
             return;
@@ -339,18 +401,7 @@ pub(crate) fn handle_update_command(
 
     messages::workspace(&workspace_path);
 
-    // Use sdk.yml from workspace root
-    let config_path = workspace_path.join("sdk.yml");
-    if !config_path.exists() {
-        messages::error(&format!(
-            "sdk.yml not found in {}",
-            workspace_path.display()
-        ));
-        messages::info("Try running 'cim init' to reinitialize");
-        return;
-    }
-
-    let mut sdk_config = match config::load_config(&config_path) {
+    let mut sdk_config = match load_config_with_extends(&config_path) {
         Ok(config) => config,
         Err(e) => {
             messages::error(&format!("Failed to load config: {}", e));
@@ -377,16 +428,45 @@ pub(crate) fn handle_update_command(
         }
     };
 
-    // Expand environment variables in mirror path
-    let expanded_mirror = expand_config_mirror_path(&sdk_config);
-    messages::verbose(&format!("Mirror: {}", expanded_mirror.display()));
-    sdk_config.mirror = expanded_mirror;
+    // Resolve the mirror directory: --mirror flag > user config > built-in default.
+    let mirror_path = resolve_mirror(mirror_override.as_deref());
+    messages::verbose(&format!("Mirror: {}", mirror_path.display()));
+
+    // Determine match pattern: --all disables filtering, CLI --match takes
+    // precedence over stored workspace marker pattern.
+    let effective_match_pattern: Option<String> = if all {
+        messages::status("Updating all repositories (--all flag, ignoring stored match filter)");
+        None
+    } else if match_pattern.is_some() {
+        match_pattern.map(|s| s.to_string())
+    } else {
+        // Read stored match pattern from workspace marker
+        let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
+        if marker_path.exists() {
+            match fs::read_to_string(&marker_path) {
+                Ok(content) => noyalib::from_str::<WorkspaceMarker>(&content)
+                    .ok()
+                    .and_then(|m| m.match_pattern),
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    };
 
     // Compile regex pattern if provided
-    let match_regex = if let Some(pattern) = match_pattern {
+    let match_regex = if let Some(ref pattern) = effective_match_pattern {
         match compile_match_regex(pattern) {
             Ok(regex) => {
-                messages::status(&format!("Filtering repositories with pattern: {}", pattern));
+                let source = if match_pattern.is_some() {
+                    "CLI"
+                } else {
+                    "workspace marker"
+                };
+                messages::status(&format!(
+                    "Filtering repositories with pattern: {} (from {})",
+                    pattern, source
+                ));
                 Some(regex)
             }
             Err(e) => {
@@ -398,14 +478,52 @@ pub(crate) fn handle_update_command(
         None
     };
 
-    // Create filtered config based on match pattern
-    let filtered_config = create_filtered_sdk_config(&sdk_config, &match_regex);
+    // Determine group selection: --all disables filtering, CLI flags take
+    // precedence over the stored workspace marker selection.
+    let (effective_include_groups, effective_exclude_groups): (Option<String>, Option<String>) =
+        if all {
+            (None, None)
+        } else if include_group.is_some() || exclude_group.is_some() {
+            (
+                include_group.map(|s| s.to_string()),
+                exclude_group.map(|s| s.to_string()),
+            )
+        } else {
+            let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
+            if marker_path.exists() {
+                match fs::read_to_string(&marker_path) {
+                    Ok(content) => {
+                        let marker = noyalib::from_str::<WorkspaceMarker>(&content).ok();
+                        (
+                            marker.as_ref().and_then(|m| m.include_groups.clone()),
+                            marker.as_ref().and_then(|m| m.exclude_groups.clone()),
+                        )
+                    }
+                    Err(_) => (None, None),
+                }
+            } else {
+                (None, None)
+            }
+        };
+
+    let include_groups = effective_include_groups
+        .as_deref()
+        .map(parse_group_list)
+        .unwrap_or_default();
+    let exclude_groups = effective_exclude_groups
+        .as_deref()
+        .map(parse_group_list)
+        .unwrap_or_default();
+
+    // Create filtered config based on match pattern and group selection
+    let filtered_config =
+        create_filtered_sdk_config(&sdk_config, &match_regex, &include_groups, &exclude_groups);
 
     // Read workspace marker to get stored no_mirror preference
-    let marker_path = workspace_path.join(".workspace");
+    let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
     let workspace_no_mirror = if marker_path.exists() {
         match fs::read_to_string(&marker_path) {
-            Ok(content) => serde_yaml::from_str::<WorkspaceMarker>(&content)
+            Ok(content) => noyalib::from_str::<WorkspaceMarker>(&content)
                 .ok()
                 .and_then(|m| m.no_mirror)
                 .unwrap_or(false),
@@ -439,13 +557,42 @@ pub(crate) fn handle_update_command(
 
     if skip_mirror {
         // Update workspace repositories directly from remote URLs
-        update_workspace_repos_no_mirror(&filtered_config, &workspace_path, false);
+        update_workspace_repos(&filtered_config, &workspace_path, false, None);
     } else {
         // Update mirror repositories in parallel
-        update_mirror_repos(&filtered_config);
+        update_mirror_repos(&filtered_config, &mirror_path);
 
         // Update workspace repositories (single-threaded to avoid conflicts)
-        update_workspace_repos(&filtered_config, &workspace_path, false);
+        update_workspace_repos(&filtered_config, &workspace_path, false, Some(&mirror_path));
+    }
+
+    // When --all is used, clear the stored match pattern from the workspace
+    // marker so subsequent updates without --all still update everything.
+    if all {
+        use dsdk_cli::workspace::{
+            update_workspace_marker_groups, update_workspace_marker_match_pattern,
+        };
+        if let Err(e) = update_workspace_marker_match_pattern(&workspace_path, None) {
+            messages::info(&format!(
+                "Note: failed to clear match pattern from workspace marker: {}",
+                e
+            ));
+        }
+        if let Err(e) = update_workspace_marker_groups(&workspace_path, None, None) {
+            messages::info(&format!(
+                "Note: failed to clear group filter from workspace marker: {}",
+                e
+            ));
+        }
+    }
+
+    // Idempotently set up direnv if configured and .envrc is not yet present.
+    if let Some(direnv_cfg) = sdk_config.direnv() {
+        if direnv_cfg.used && !workspace_path.join(".envrc").exists() {
+            if let Err(e) = setup_direnv(&workspace_path, direnv_cfg, false) {
+                messages::info(&format!("Note: direnv setup encountered an issue: {}", e));
+            }
+        }
     }
 
     // Print any available update notice after the main work is done
@@ -461,10 +608,10 @@ pub(crate) enum MirrorOperationResult {
 }
 
 /// Update mirror repositories in parallel
-pub(crate) fn update_mirror_repos<T: config::SdkConfigCore>(sdk_config: &T) {
+pub(crate) fn update_mirror_repos<T: config::SdkConfigCore>(sdk_config: &T, mirror_path: &Path) {
     // Create or update mirror directory
-    if !sdk_config.mirror().exists() {
-        if let Err(e) = std::fs::create_dir_all(sdk_config.mirror()) {
+    if !mirror_path.exists() {
+        if let Err(e) = std::fs::create_dir_all(mirror_path) {
             messages::error(&format!("Error creating mirror directory: {}", e));
             return;
         }
@@ -475,7 +622,7 @@ pub(crate) fn update_mirror_repos<T: config::SdkConfigCore>(sdk_config: &T) {
 
     for git_cfg in sdk_config.gits() {
         let git_cfg = git_cfg.clone();
-        let mirror_path = sdk_config.mirror().clone();
+        let mirror_path = mirror_path.to_path_buf();
 
         pool.execute(move || {
             let repo_mirror_path = dsdk_cli::git_manager::get_mirror_repo_path(
@@ -537,7 +684,9 @@ pub(crate) fn update_mirror_repos<T: config::SdkConfigCore>(sdk_config: &T) {
             } else {
                 // Clone new mirror
                 messages::progress(&git_cfg.name, "cloning new repository");
+                let spinner = messages::Spinner::start(&git_cfg.name, "cloning mirror…");
                 let clone_result = git_operations::clone_mirror(&git_cfg.url, &repo_mirror_path);
+                spinner.finish();
 
                 match clone_result {
                     Ok(result) => {
@@ -582,6 +731,7 @@ pub(crate) fn update_workspace_repos<T: config::SdkConfigCore>(
     sdk_config: &T,
     workspace_path: &Path,
     is_init: bool,
+    mirror_path: Option<&Path>,
 ) {
     let action = if is_init { "Initializing" } else { "Updating" };
     messages::status(&format!("\n{} workspace repositories...", action));
@@ -594,21 +744,24 @@ pub(crate) fn update_workspace_repos<T: config::SdkConfigCore>(
         }
     };
 
+    let mirror_path = mirror_path.map(|p| p.to_path_buf());
+
     for tier in &tiers {
         let pool = ThreadPool::new(4);
 
         for git_cfg in tier {
             let git_cfg = git_cfg.clone();
             let workspace_path = workspace_path.to_path_buf();
-            let mirror_path = sdk_config.mirror().clone();
+            let mirror_path = mirror_path.clone();
 
             pool.execute(move || {
+                let mirror_path = mirror_path.as_deref();
                 let repo_workspace_path = workspace_path.join(&git_cfg.name);
 
                 let success = if repo_workspace_path.join(".git").is_dir() {
-                    handle_existing_workspace_repo(&git_cfg, &repo_workspace_path, &mirror_path)
+                    handle_existing_workspace_repo(&git_cfg, &repo_workspace_path, mirror_path)
                 } else {
-                    clone_repo_to_workspace(&git_cfg, &repo_workspace_path, &mirror_path)
+                    clone_repo_to_workspace(&git_cfg, &repo_workspace_path, mirror_path)
                 };
 
                 // Print result immediately
@@ -627,6 +780,7 @@ pub(crate) fn update_workspace_repos_with_result<T: config::SdkConfigCore>(
     sdk_config: &T,
     workspace_path: &Path,
     is_init: bool,
+    mirror_path: Option<&Path>,
 ) -> bool {
     let action = if is_init { "Initializing" } else { "Updating" };
     messages::status(&format!("\n{} workspace repositories...", action));
@@ -641,122 +795,28 @@ pub(crate) fn update_workspace_repos_with_result<T: config::SdkConfigCore>(
 
     let any_failed = Arc::new(AtomicBool::new(false));
 
+    let mirror_path = mirror_path.map(|p| p.to_path_buf());
+
     for tier in &tiers {
         let pool = ThreadPool::new(4);
 
         for git_cfg in tier {
             let git_cfg = git_cfg.clone();
             let workspace_path = workspace_path.to_path_buf();
-            let mirror_path = sdk_config.mirror().clone();
+            let mirror_path = mirror_path.clone();
             let any_failed = Arc::clone(&any_failed);
 
             pool.execute(move || {
                 let repo_workspace_path = workspace_path.join(&git_cfg.name);
 
                 let success = if repo_workspace_path.join(".git").is_dir() {
-                    handle_existing_workspace_repo(&git_cfg, &repo_workspace_path, &mirror_path)
+                    handle_existing_workspace_repo(
+                        &git_cfg,
+                        &repo_workspace_path,
+                        mirror_path.as_deref(),
+                    )
                 } else {
-                    clone_repo_to_workspace(&git_cfg, &repo_workspace_path, &mirror_path)
-                };
-
-                // Print result immediately and track failures
-                if !success {
-                    messages::error(&format!("{} (failed)", git_cfg.name));
-                    any_failed.store(true, Ordering::Relaxed);
-                }
-            });
-        }
-
-        pool.join();
-    }
-
-    any_failed.load(Ordering::Relaxed)
-}
-
-/// Update workspace repositories directly from remote URLs (no mirror)
-pub(crate) fn update_workspace_repos_no_mirror<T: config::SdkConfigCore>(
-    sdk_config: &T,
-    workspace_path: &Path,
-    is_init: bool,
-) {
-    let action = if is_init { "Initializing" } else { "Updating" };
-    messages::status(&format!(
-        "\n{} workspace repositories directly from remote URLs...",
-        action
-    ));
-
-    let tiers = match config::resolve_clone_order(sdk_config.gits()) {
-        Ok(t) => t,
-        Err(e) => {
-            messages::error(&format!("Dependency resolution failed: {}", e));
-            return;
-        }
-    };
-
-    for tier in &tiers {
-        let pool = ThreadPool::new(4);
-
-        for git_cfg in tier {
-            let git_cfg = git_cfg.clone();
-            let workspace_path = workspace_path.to_path_buf();
-
-            pool.execute(move || {
-                let repo_workspace_path = workspace_path.join(&git_cfg.name);
-
-                let success = if repo_workspace_path.join(".git").is_dir() {
-                    handle_existing_workspace_repo_no_mirror(&git_cfg, &repo_workspace_path)
-                } else {
-                    clone_repo_to_workspace_no_mirror(&git_cfg, &repo_workspace_path)
-                };
-
-                // Print result immediately
-                if !success {
-                    messages::error(&format!("{} (failed)", git_cfg.name));
-                }
-            });
-        }
-
-        pool.join();
-    }
-}
-
-/// Update workspace repositories directly from remote URLs (no mirror), returns true if any failed
-pub(crate) fn update_workspace_repos_no_mirror_with_result<T: config::SdkConfigCore>(
-    sdk_config: &T,
-    workspace_path: &Path,
-    is_init: bool,
-) -> bool {
-    let action = if is_init { "Initializing" } else { "Updating" };
-    messages::status(&format!(
-        "\n{} workspace repositories directly from remote URLs...",
-        action
-    ));
-
-    let tiers = match config::resolve_clone_order(sdk_config.gits()) {
-        Ok(t) => t,
-        Err(e) => {
-            messages::error(&format!("Dependency resolution failed: {}", e));
-            return true;
-        }
-    };
-
-    let any_failed = Arc::new(AtomicBool::new(false));
-
-    for tier in &tiers {
-        let pool = ThreadPool::new(4);
-
-        for git_cfg in tier {
-            let git_cfg = git_cfg.clone();
-            let workspace_path = workspace_path.to_path_buf();
-            let any_failed = Arc::clone(&any_failed);
-
-            pool.execute(move || {
-                let repo_workspace_path = workspace_path.join(&git_cfg.name);
-
-                let success = if repo_workspace_path.join(".git").is_dir() {
-                    handle_existing_workspace_repo_no_mirror(&git_cfg, &repo_workspace_path)
-                } else {
-                    clone_repo_to_workspace_no_mirror(&git_cfg, &repo_workspace_path)
+                    clone_repo_to_workspace(&git_cfg, &repo_workspace_path, mirror_path.as_deref())
                 };
 
                 // Print result immediately and track failures
@@ -777,36 +837,64 @@ pub(crate) fn update_workspace_repos_no_mirror_with_result<T: config::SdkConfigC
 pub(crate) fn handle_existing_workspace_repo(
     git_cfg: &config::GitConfig,
     repo_path: &Path,
-    mirror_path: &Path,
+    mirror_path: Option<&Path>,
 ) -> bool {
-    // Add mirror and set origin to upstream
-    let mirror_repo_path =
-        dsdk_cli::git_manager::get_mirror_repo_path(mirror_path, &git_cfg.name, &git_cfg.url);
-    let _ = git_operations::git_command(
-        &["remote", "set-url", "origin", &git_cfg.url],
-        Some(repo_path),
-    );
-    let _ = git_operations::git_command(
-        &[
-            "remote",
-            "add",
+    let refs = git_operations::ls_remote(&git_cfg.url, true, true).unwrap_or_default();
+    let (fetch_refspec, update_ref_name, sha) =
+        git_operations::resolve_fetch_refspec(&refs, &git_cfg.commit);
+    let target = sha.unwrap_or_else(|| git_cfg.commit.clone());
+
+    // Track which remote was used to fetch so we can resolve "latest" against
+    // the right remote-tracking ref.  When a mirror is in use the workspace
+    // fetches from "mirror", so origin/* is stale and mirror/* is current.
+    let preferred_remote: Option<&str> = mirror_path.map(|_| "mirror");
+
+    let success = if let Some(mirror_path) = mirror_path {
+        let mirror_repo_path =
+            dsdk_cli::git_manager::get_mirror_repo_path(mirror_path, &git_cfg.name, &git_cfg.url);
+
+        let _ = git_operations::remote_set_url(repo_path, "origin", &git_cfg.url);
+        let _ = git_operations::remote_add(
+            repo_path,
             "mirror",
-            &format!("file://{}", mirror_repo_path.display()),
-        ],
-        Some(repo_path),
-    );
+            &git_operations::path_to_file_url(&mirror_repo_path),
+        );
 
-    // Fetch from mirror first
-    let mirror_result = git_operations::git_command(&["fetch", "mirror"], Some(repo_path));
-
-    // Always fetch from origin as well (to get any missing objects)
-    let origin_result = git_operations::git_command(&["fetch", "origin"], Some(repo_path));
-
-    let success = match (mirror_result, origin_result) {
-        (Ok(mirror_out), Ok(origin_out)) => mirror_out.success || origin_out.success,
-        (Ok(mirror_out), Err(_)) => mirror_out.success,
-        (Err(_), Ok(origin_out)) => origin_out.success,
-        _ => false,
+        if mirror_repo_path.exists() {
+            if !git_operations::cat_file(&mirror_repo_path, &target) {
+                let fetch_ok =
+                    git_operations::fetch_ref(&mirror_repo_path, "origin", &fetch_refspec, Some(1))
+                        .is_ok_and(|r| r.is_success());
+                if fetch_ok {
+                    let _ = git_operations::update_ref(
+                        &mirror_repo_path,
+                        &update_ref_name,
+                        "FETCH_HEAD",
+                    );
+                }
+            }
+            // Local mirror: no depth limit — objects are on disk, no network cost,
+            // and shallow fetches would write a .git/shallow file that cuts history.
+            //
+            // Use a mapping refspec for branches so that git updates the
+            // refs/remotes/mirror/<branch> tracking ref in the workspace.
+            // Without this, the fetch only writes FETCH_HEAD and
+            // get_latest_commit_for_branch_with_remote("mirror") would find nothing.
+            let mirror_fetch_refspec =
+                if let Some(branch) = fetch_refspec.strip_prefix("refs/heads/") {
+                    format!("refs/heads/{}:refs/remotes/mirror/{}", branch, branch)
+                } else {
+                    fetch_refspec.clone()
+                };
+            git_operations::fetch_ref(repo_path, "mirror", &mirror_fetch_refspec, None)
+                .is_ok_and(|r| r.is_success())
+        } else {
+            git_operations::fetch_ref(repo_path, "origin", &fetch_refspec, Some(1))
+                .is_ok_and(|r| r.is_success())
+        }
+    } else {
+        git_operations::fetch_ref(repo_path, "origin", &fetch_refspec, Some(1))
+            .is_ok_and(|r| r.is_success())
     };
 
     if success {
@@ -816,10 +904,14 @@ pub(crate) fn handle_existing_workspace_repo(
                 // Clean: safe to reset
                 // Check if the commit is a branch reference
                 if is_branch_reference(repo_path, &git_cfg.commit) {
-                    // For branches, get the latest commit and checkout that
-                    if let Some(latest_commit) =
-                        get_latest_commit_for_branch(repo_path, &git_cfg.commit)
-                    {
+                    // For branches, get the latest commit and checkout that.
+                    // Pass the preferred remote so we read the freshly-fetched
+                    // tracking ref (mirror/*) rather than the stale origin/*.
+                    if let Some(latest_commit) = get_latest_commit_for_branch_with_remote(
+                        repo_path,
+                        &git_cfg.commit,
+                        preferred_remote,
+                    ) {
                         let checkout_output = git_operations::checkout(repo_path, &latest_commit);
                         match checkout_output {
                             Ok(result) if result.is_success() => {
@@ -897,10 +989,7 @@ pub(crate) fn handle_existing_workspace_repo(
             }
         }
     } else {
-        messages::error(&format!(
-            "{} (failed to fetch from mirror and origin)",
-            git_cfg.name
-        ));
+        messages::error(&format!("{} (fetch failed)", git_cfg.name));
         false
     }
 }
@@ -909,7 +998,7 @@ pub(crate) fn handle_existing_workspace_repo(
 pub(crate) fn clone_repo_to_workspace(
     git_cfg: &config::GitConfig,
     repo_path: &Path,
-    mirror_path: &Path,
+    mirror_path: Option<&Path>,
 ) -> bool {
     // Remove directory if it exists but is not a git repo (e.g., created by
     // a parent repo clone in a previous tier)
@@ -924,77 +1013,112 @@ pub(crate) fn clone_repo_to_workspace(
     }
 
     messages::progress(&git_cfg.name, "cloning repository");
+    let spinner = messages::Spinner::start(&git_cfg.name, "cloning…");
 
-    let mirror_repo_path =
-        dsdk_cli::git_manager::get_mirror_repo_path(mirror_path, &git_cfg.name, &git_cfg.url);
+    if let Some(mirror_path) = mirror_path {
+        let mirror_repo_path =
+            dsdk_cli::git_manager::get_mirror_repo_path(mirror_path, &git_cfg.name, &git_cfg.url);
 
-    // Determine the clone source (prefer mirror if exists, otherwise use original URL)
-    let clone_source = if mirror_repo_path.exists() {
-        format!("file://{}", mirror_repo_path.display())
-    } else {
-        git_cfg.url.clone()
-    };
-
-    let should_timeout = clone_source.starts_with("git@") || clone_source.starts_with("ssh://");
-
-    if mirror_repo_path.exists() {
-        // Use --reference to hardlink objects from the mirror
-        let result = git_operations::clone_repo(&clone_source, repo_path, Some(&mirror_repo_path));
-
-        match result {
-            Ok(result) if result.is_success() => {
-                // Set origin to upstream and add mirror remote
-                let _ = git_operations::remote_set_url(repo_path, "origin", &git_cfg.url);
-                let _ = git_operations::remote_add(
-                    repo_path,
-                    "mirror",
-                    &format!("file://{}", mirror_repo_path.display()),
-                );
-                return checkout_commit(git_cfg, repo_path);
-            }
-            _ => {
-                messages::error(&format!("{} (clone failed)", git_cfg.name));
-                return false;
-            }
-        }
-    } else if should_timeout {
-        // Use timeout for SSH URLs
-        if let Some(child) = execute_git_clone(
-            "git",
-            &["clone", &clone_source, &repo_path.to_string_lossy()],
-            git_cfg,
-        ) {
-            if let Ok(output) = child.wait_with_output() {
-                if output.status.success() {
-                    // Set origin to upstream
-                    let _ = git_operations::remote_set_url(repo_path, "origin", &git_cfg.url);
-                    return checkout_commit(git_cfg, repo_path);
-                } else {
-                    messages::error(&format!("{} (clone failed)", git_cfg.name));
+        if mirror_repo_path.exists() {
+            // git clone --reference refuses shallow repositories; unshallow before cloning
+            if mirror_repo_path.join("shallow").exists() {
+                messages::progress(&git_cfg.name, "mirror is shallow, unshallowing");
+                let ok = git_operations::fetch_unshallow(&mirror_repo_path)
+                    .is_ok_and(|r| r.is_success());
+                if !ok {
+                    messages::error(&format!("{} (failed to unshallow mirror)", git_cfg.name));
                     return false;
                 }
             }
-        } else {
-            messages::error(&format!("{} (clone timed out)", git_cfg.name));
-            return false;
-        }
-    } else {
-        // Direct execution for HTTP/HTTPS/file URLs
-        let result = git_operations::clone_repo(&clone_source, repo_path, None);
 
-        match result {
-            Ok(result) if result.is_success() => {
-                // Set origin to upstream
-                let _ = git_operations::remote_set_url(repo_path, "origin", &git_cfg.url);
-                return checkout_commit(git_cfg, repo_path);
+            spinner.set_action(&git_cfg.name, "resolving refs…");
+            let refs = git_operations::ls_remote(&git_cfg.url, true, true).unwrap_or_default();
+            let (fetch_refspec, update_ref_name, sha) =
+                git_operations::resolve_fetch_refspec(&refs, &git_cfg.commit);
+            let target_sha = sha.unwrap_or_else(|| git_cfg.commit.clone());
+
+            // Ensure the commit is present in the mirror, fetching it if needed
+            if !git_operations::cat_file(&mirror_repo_path, &target_sha) {
+                spinner.set_action(&git_cfg.name, "fetching into mirror…");
+                let fetch_ok =
+                    git_operations::fetch_ref(&mirror_repo_path, "origin", &fetch_refspec, Some(1))
+                        .is_ok_and(|r| r.is_success());
+                if fetch_ok {
+                    let _ = git_operations::update_ref(
+                        &mirror_repo_path,
+                        &update_ref_name,
+                        "FETCH_HEAD",
+                    );
+                } else {
+                    spinner.finish();
+                    messages::error(&format!(
+                        "{} (commit {} not found in remote — check the commit hash in sdk.yml)",
+                        git_cfg.name, target_sha
+                    ));
+                    return false;
+                }
             }
-            _ => {
-                messages::error(&format!("{} (clone failed)", git_cfg.name));
-                return false;
+
+            spinner.set_action(&git_cfg.name, "cloning from mirror…");
+            let mirror_url = git_operations::path_to_file_url(&mirror_repo_path);
+            let result =
+                git_operations::clone_repo(&mirror_url, repo_path, Some(&mirror_repo_path));
+            match result {
+                Ok(result) if result.is_success() => {
+                    // Set origin to upstream and add mirror remote
+                    let _ = git_operations::remote_set_url(repo_path, "origin", &git_cfg.url);
+                    let _ = git_operations::remote_add(
+                        repo_path,
+                        "mirror",
+                        &git_operations::path_to_file_url(&mirror_repo_path),
+                    );
+                    spinner.set_action(&git_cfg.name, "checking out…");
+                    let ok = checkout_commit(git_cfg, repo_path);
+                    spinner.finish();
+                    return ok;
+                }
+                Ok(result) => {
+                    spinner.finish();
+                    messages::error(&format!(
+                        "{} (clone failed: {})",
+                        git_cfg.name,
+                        result.stderr.trim()
+                    ));
+                    return false;
+                }
+                Err(e) => {
+                    spinner.finish();
+                    messages::error(&format!("{} (clone failed: {})", git_cfg.name, e));
+                    return false;
+                }
             }
         }
     }
-    false
+
+    // Direct clone (no mirror, or mirror path not yet on disk)
+    let result = git_operations::clone_repo(&git_cfg.url, repo_path, None);
+    match result {
+        Ok(result) if result.is_success() => {
+            spinner.set_action(&git_cfg.name, "checking out…");
+            let ok = checkout_commit(git_cfg, repo_path);
+            spinner.finish();
+            ok
+        }
+        Ok(result) => {
+            spinner.finish();
+            messages::error(&format!(
+                "{} (clone failed: {})",
+                git_cfg.name,
+                result.stderr.trim()
+            ));
+            false
+        }
+        Err(e) => {
+            spinner.finish();
+            messages::error(&format!("{} (clone failed: {})", git_cfg.name, e));
+            false
+        }
+    }
 }
 
 /// Checkout the specified commit for a repository
@@ -1067,527 +1191,43 @@ pub(crate) fn checkout_commit(git_cfg: &config::GitConfig, repo_path: &Path) -> 
     }
 }
 
-/// Execute a git clone command and wait for completion
-pub(crate) fn execute_git_clone(
-    command: &str,
-    args: &[&str],
-    git_cfg: &config::GitConfig,
-) -> Option<Child> {
-    let start = Instant::now();
-    let mut child = match Command::new(command)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            messages::error(&format!(
-                "Failed to start git clone for {}: {}",
-                git_cfg.name, e
-            ));
-            return None;
-        }
-    };
-
-    // Provide periodic updates for long-running operations
-    let mut last_update = start;
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                messages::status(&format!(
-                    "Git clone for {} completed in {:.1}s",
-                    git_cfg.name,
-                    start.elapsed().as_secs_f64()
-                ));
-                return Some(child);
-            }
-            Ok(None) => {
-                // Provide periodic updates for long-running operations
-                if last_update.elapsed() > Duration::from_secs(30) {
-                    messages::status(&format!(
-                        "Still cloning {} (elapsed: {:.1}s)...",
-                        git_cfg.name,
-                        start.elapsed().as_secs_f64()
-                    ));
-                    last_update = Instant::now();
-                }
-                thread::sleep(Duration::from_millis(500));
-            }
-            Err(e) => {
-                messages::error(&format!(
-                    "Error waiting for git clone for {}: {}",
-                    git_cfg.name, e
-                ));
-                return None;
-            }
-        }
-    }
-}
-
-/// Handle an existing repository in the workspace (no mirror mode)
-pub(crate) fn handle_existing_workspace_repo_no_mirror(
-    git_cfg: &config::GitConfig,
-    repo_path: &Path,
-) -> bool {
-    // Fetch directly from origin
-    let origin_result = git_operations::fetch(repo_path, Some("origin"));
-
-    let success = match origin_result {
-        Ok(result) => result.is_success(),
-        Err(_) => false,
-    };
-
-    if success {
-        // Only reset if repo is clean
-        match dsdk_cli::git_manager::repo_has_pending_changes(repo_path) {
-            Ok(false) => {
-                // Clean: safe to reset
-                // Check if the commit is a branch reference
-                if is_branch_reference(repo_path, &git_cfg.commit) {
-                    // For branches, get the latest commit and checkout that
-                    if let Some(latest_commit) =
-                        get_latest_commit_for_branch(repo_path, &git_cfg.commit)
-                    {
-                        let checkout_output = git_operations::checkout(repo_path, &latest_commit);
-                        match checkout_output {
-                            Ok(result) if result.is_success() => {
-                                messages::success(&format!(
-                                    "{} (updated {} to latest: {})",
-                                    git_cfg.name,
-                                    git_cfg.commit,
-                                    &latest_commit[..8]
-                                ));
-                                true
-                            }
-                            _ => {
-                                messages::error(&format!(
-                                    "{} (failed to checkout latest {})",
-                                    git_cfg.name, latest_commit
-                                ));
-                                false
-                            }
-                        }
-                    } else {
-                        // Fallback to original behavior if we can't get latest
-                        let checkout_output = git_operations::checkout(repo_path, &git_cfg.commit);
-                        match checkout_output {
-                            Ok(result) if result.is_success() => {
-                                messages::success(&format!(
-                                    "{} (updated to {})",
-                                    git_cfg.name, git_cfg.commit
-                                ));
-                                true
-                            }
-                            _ => {
-                                messages::error(&format!(
-                                    "{} (failed to checkout {})",
-                                    git_cfg.name, git_cfg.commit
-                                ));
-                                false
-                            }
-                        }
-                    }
-                } else {
-                    // For tags and specific commits, use the exact reference
-                    let checkout_result = git_operations::checkout(repo_path, &git_cfg.commit);
-                    match checkout_result {
-                        Ok(result) if result.is_success() => {
-                            messages::success(&format!(
-                                "{} (pinned to {})",
-                                git_cfg.name, git_cfg.commit
-                            ));
-                            true
-                        }
-                        _ => {
-                            messages::error(&format!(
-                                "{} (failed to checkout {})",
-                                git_cfg.name, git_cfg.commit
-                            ));
-                            false
-                        }
-                    }
-                }
-            }
-            Ok(true) => {
-                // Dirty: do nothing
-                messages::info(&format!(
-                    "! {} has pending changes, not resetting to {}",
-                    git_cfg.name, git_cfg.commit
-                ));
-                true
-            }
-            Err(e) => {
-                messages::error(&format!(
-                    "Error checking repo status for {}: {}",
-                    git_cfg.name, e
-                ));
-                false
-            }
-        }
-    } else {
-        messages::error(&format!("{} (fetch failed)", git_cfg.name));
-        false
-    }
-}
-
-/// Clone a repository to the workspace (no mirror mode)
-pub(crate) fn clone_repo_to_workspace_no_mirror(
-    git_cfg: &config::GitConfig,
-    repo_path: &Path,
-) -> bool {
-    // Remove directory if it exists but is not a git repo (e.g., created by
-    // a parent repo clone in a previous tier)
-    if repo_path.exists() && !repo_path.join(".git").is_dir() {
-        if let Err(e) = std::fs::remove_dir_all(repo_path) {
-            messages::error(&format!(
-                "{} (failed to remove non-git directory: {})",
-                git_cfg.name, e
-            ));
-            return false;
-        }
-    }
-
-    let should_timeout = git_cfg.url.starts_with("git@") || git_cfg.url.starts_with("ssh://");
-
-    if should_timeout {
-        // Use timeout for SSH URLs
-        if let Some(child) = execute_git_clone(
-            "git",
-            &["clone", &git_cfg.url, &repo_path.to_string_lossy()],
-            git_cfg,
-        ) {
-            if let Ok(output) = child.wait_with_output() {
-                if output.status.success() {
-                    return checkout_commit(git_cfg, repo_path);
-                } else {
-                    messages::error(&format!("{} (clone failed)", git_cfg.name));
-                    return false;
-                }
-            }
-        } else {
-            messages::error(&format!("{} (clone timed out)", git_cfg.name));
-            return false;
-        }
-    } else {
-        // Direct execution for HTTP/HTTPS/file URLs
-        let result = git_operations::clone_repo(&git_cfg.url, repo_path, None);
-
-        match result {
-            Ok(result) if result.is_success() => {
-                return checkout_commit(git_cfg, repo_path);
-            }
-            _ => {
-                messages::error(&format!("{} (clone failed)", git_cfg.name));
-                return false;
-            }
-        }
-    }
-    false
-}
-
 /// Handle Docker commands
 pub(crate) fn handle_docker_command(docker_command: &DockerCommand) {
-    // Docker command must be run from the dsdk source repository folder
-    let current_dir = std::env::current_dir().unwrap_or_else(|e| {
-        messages::error(&format!("Could not get current directory: {}", e));
-        std::process::exit(1);
-    });
-
-    // Check if we're in the dsdk source folder by looking for Cargo.toml and dsdk-cli/src/main.rs
-    let cargo_toml = current_dir.join("Cargo.toml");
-    let dsdk_cli_main = current_dir.join("dsdk-cli/src/main.rs");
-
-    if !cargo_toml.exists() || !dsdk_cli_main.exists() {
-        messages::error("Docker command must be run from the cim source repository");
-        messages::status(&format!("Current directory: {}", current_dir.display()));
-        messages::status("Missing required files:");
-        if !cargo_toml.exists() {
-            messages::status("  - Cargo.toml");
-        }
-        if !dsdk_cli_main.exists() {
-            messages::status("  - dsdk-cli/src/main.rs");
-        }
-        messages::status("");
-        messages::status("Please cd to your cim source repository and run the command again.");
-        return;
-    }
-
     match docker_command {
         DockerCommand::Create {
             target,
             source,
             version,
             distro,
-            profile,
-            arch,
-            output: _, // Dockerfile always created in temp directory
+            output,
             force,
-            force_https,
-            force_ssh,
-            no_mirror,
-            r#match,
         } => {
-            // Get docker temp directory for storing extracted manifests
-            let docker_temp_dir = match get_docker_temp_dir() {
-                Ok(dir) => dir,
-                Err(e) => {
-                    messages::error(&format!("Failed to create docker temp directory: {}", e));
-                    return;
-                }
-            };
-
-            // Load user config for no_mirror preference
-            let user_config = config::UserConfig::load().ok().flatten();
-
-            // Determine if we should skip mirror with precedence:
-            // CLI flag > user config > default (false)
-            let skip_mirror = *no_mirror
-                || user_config
-                    .as_ref()
-                    .and_then(|uc| uc.no_mirror)
-                    .unwrap_or(false);
-
-            // Determine source path (use user config default if available)
-            let default_source = get_default_source();
-            let source_path = source
-                .as_ref()
-                .map(String::as_str)
-                .unwrap_or(&default_source);
-
-            // Resolve config path using the same approach as init command
-            // For git sources, extract to docker_temp_dir instead of using mem::forget
-            let config_path = if is_url(source_path) {
-                // Git-based source - clone entire target directory structure to docker temp dir
-                match resolve_target_config_from_git(
-                    source_path,
-                    target,
-                    version.as_deref(),
-                    Some(&docker_temp_dir),
-                ) {
-                    Ok(path) => {
-                        let version_info = if let Some(v) = &version {
-                            format!(" (version: {})", v)
-                        } else {
-                            " (latest)".to_string()
-                        };
-                        messages::status(&format!(
-                            "Fetched config for target '{}'{}",
-                            target, version_info
-                        ));
-                        path
-                    }
-                    Err(e) => {
-                        messages::error(&e.to_string());
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                // Local source directory
-                let source_path_buf = PathBuf::from(&source_path);
-
-                // Check if version is specified and source is a git repository
-                if version.is_some() && source_path_buf.join(".git").exists() {
-                    // Local git with version - extract to docker temp dir
-                    match resolve_target_config_from_git(
-                        source_path,
-                        target,
-                        version.as_deref(),
-                        Some(&docker_temp_dir),
-                    ) {
-                        Ok(path) => {
-                            let version_info = format!(" (version: {})", version.as_ref().unwrap());
-                            messages::status(&format!(
-                                "Fetched config for target '{}'{}",
-                                target, version_info
-                            ));
-                            path
-                        }
-                        Err(e) => {
-                            messages::error(&e.to_string());
-                            std::process::exit(1);
-                        }
-                    }
-                } else {
-                    // No version or not a git repo - use direct path
-                    match resolve_target_config(target, &source_path_buf) {
-                        Ok(path) => path,
-                        Err(e) => {
-                            messages::error(&e.to_string());
-                            messages::status("Available targets:");
-                            if let Ok(targets) = list_available_targets(&source_path_buf) {
-                                for target_name in targets {
-                                    messages::status(&format!("  - {}", target_name));
-                                }
-                            }
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            };
-
-            // Validate core config exists and is loadable
-            if let Err(e) = config::load_config(&config_path) {
-                messages::error(&format!(
-                    "Failed to load SDK config from {}: {}",
-                    config_path.display(),
-                    e
-                ));
-                return;
-            }
-
-            // Load the full config with dependencies (required for Docker generation)
-            let (full_sdk_config, os_deps) = match config::load_config_with_os_deps(&config_path) {
-                Ok((config, Some(deps))) => (config, deps),
-                Ok((_, None)) => {
-                    messages::error("os-dependencies.yml is required for Docker generation");
-                    messages::info(
-                        "Please ensure os-dependencies.yml exists in the target directory",
-                    );
-                    return;
-                }
-                Err(e) => {
-                    messages::error(&format!("Could not load dependency files: {}", e));
-                    messages::info("Please ensure os-dependencies.yml exists and is valid YAML");
-                    return;
-                }
-            };
-
-            // Load python dependencies from the same directory as the config
-            let config_dir = config_path
-                .parent()
-                .expect("Config path should have parent directory");
-            let python_deps_path = config_dir.join("python-dependencies.yml");
-            let python_deps = match config::load_python_dependencies(&python_deps_path) {
-                Ok(deps) => deps,
-                Err(e) => {
-                    messages::error(&format!("Could not load python-dependencies.yml: {}", e));
-                    messages::status(&format!("Config directory: {}", config_dir.display()));
-                    messages::status(&format!("Expected file: {}", python_deps_path.display()));
-                    return;
-                }
-            };
-
-            // Apply filtering if --match is provided
-            let filtered_sdk_config = if let Some(pattern) = r#match {
-                // Compile regex - if it fails, exit with error
-                let match_regex = match compile_match_regex(pattern) {
-                    Ok(regex) => Some(regex),
-                    Err(e) => {
-                        messages::error(&e);
-                        return;
-                    }
-                };
-                let filtered_gits = filter_git_configs(&full_sdk_config.gits, &match_regex);
-                messages::status(&format!(
-                    "Filtered to {} repositories (from {} total)",
-                    filtered_gits.len(),
-                    full_sdk_config.gits.len()
-                ));
-                config::SdkConfig {
-                    mirror: full_sdk_config.mirror.clone(),
-                    gits: filtered_gits,
-                    toolchains: full_sdk_config.toolchains.clone(),
-                    copy_files: full_sdk_config.copy_files.clone(),
-                    install: full_sdk_config.install.clone(),
-                    makefile_include: full_sdk_config.makefile_include.clone(),
-                    envsetup: full_sdk_config.envsetup.clone(),
-                    test: full_sdk_config.test.clone(),
-                    clean: full_sdk_config.clean.clone(),
-                    build: full_sdk_config.build.clone(),
-                    flash: full_sdk_config.flash.clone(),
-                    variables: full_sdk_config.variables.clone(),
-                }
-            } else {
-                // No filtering, use original config
-                full_sdk_config.clone()
-            };
-
-            // Get the temp directory containing all config files
-            let config_dir = config_path
-                .parent()
-                .expect("Config path should have parent directory");
-
-            // Copy cross-compiled binary to temp directory so it's in Docker build context
-            let source_binary = current_dir
-                .join("target")
-                .join(arch)
-                .join("release")
-                .join("cim");
-
-            let dest_binary = config_dir.join("cim");
-
-            if !source_binary.exists() {
-                messages::error(&format!(
-                    "Cross-compiled binary not found at {}",
-                    source_binary.display()
-                ));
-                messages::info(&format!(
-                    "Please run: cross build --release --target {}",
-                    arch
-                ));
-                return;
-            }
-
-            if let Err(e) = fs::copy(&source_binary, &dest_binary) {
-                messages::error(&format!("Failed to copy binary to temp directory: {}", e));
-                return;
-            }
-            messages::verbose(&format!("Copied {} binary to build context", arch));
-
-            // Dockerfile will be created in the temp directory alongside config files
-            // This makes all files (including the binary) accessible within Docker's build context
-
-            let dockerfile_output = config_dir.join("Dockerfile");
-
-            let docker_manager =
-                docker_manager::DockerManager::new(current_dir.clone(), config_dir.to_path_buf());
-            messages::status("Generating Dockerfile...");
+            let distro_str = distro.as_deref().unwrap_or("ubuntu:22.04");
 
             let config = docker_manager::DockerfileConfig {
-                sdk_config: &filtered_sdk_config,
-                os_deps: &os_deps,
-                python_deps: &python_deps,
-                output_path: &dockerfile_output,
-                distro_preference: distro.as_deref(),
-                python_profile: profile,
+                target,
+                version: version.as_deref(),
+                source: source.as_deref(),
+                distro: distro_str,
+                output_path: output,
                 force: *force,
-                force_https: *force_https,
-                force_ssh: *force_ssh,
-                no_mirror: skip_mirror,
             };
-            match docker_manager.create_dockerfile(config) {
-                Ok(_) => {
-                    // docker_manager.create_dockerfile already prints success message with details
 
-                    // Show build instructions
+            match docker_manager::create_dockerfile(&config) {
+                Ok(()) => {
+                    messages::success(&format!("Dockerfile created at '{}'", output.display()));
                     messages::status("");
                     messages::status("To build the Docker image:");
-                    messages::status(&format!("  cd {}", config_dir.display()));
+                    messages::status(&format!(
+                        "  docker build -t sdk-image -f {} .",
+                        output.display()
+                    ));
                     messages::status("");
-                    messages::status(
-                        "For a setup known to have all git repositories being public:",
-                    );
-                    messages::status("  docker build -t sdk-image .");
-                    messages::status("");
-                    messages::status("For a setup with private GitHub repositories:");
-                    messages::status("  export GITHUB_TOKEN=<your_token>");
-                    messages::status(
-                        "  docker build --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN -t sdk-image .",
-                    );
-                    messages::status("");
-                    messages::status("Create a token at: https://github.com/settings/tokens");
-                    messages::status("Required scopes: repo (for private repos)");
-                    messages::status("");
-                    messages::status("For organizations with SAML SSO:");
-                    messages::status("  After creating the token, authorize it at:");
-                    messages::status(
-                        "  https://github.com/settings/tokens → Configure SSO → Authorize",
-                    );
+                    messages::status("To run the image:");
+                    messages::status("  docker run -it sdk-image");
                 }
                 Err(e) => {
-                    messages::error(&format!("Failed to create Dockerfile: {}", e));
+                    messages::error(&format!("{}", e));
                 }
             }
         }

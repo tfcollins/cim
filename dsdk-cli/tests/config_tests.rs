@@ -24,12 +24,11 @@ fn test_load_valid_minimal_config() {
     let fixture = TestFixture::new();
     let config_path = fixture.path().join("sdk.yml");
 
-    let config = create_minimal_sdk_config(fixture.path());
+    let config = create_minimal_sdk_config();
     write_sdk_config(&config, &config_path);
 
     let loaded = load_config(&config_path).expect("Should load minimal config");
     assert_eq!(loaded.gits.len(), 0);
-    assert_eq!(loaded.mirror, fixture.path());
 }
 
 #[test]
@@ -37,25 +36,21 @@ fn test_load_config_with_repositories() {
     let fixture = TestFixture::new();
     let config_path = fixture.path().join("sdk.yml");
 
-    let mut config = create_minimal_sdk_config(fixture.path());
+    let mut config = create_minimal_sdk_config();
     config.gits = vec![
         GitConfig {
             name: "repo1".to_string(),
             url: "https://github.com/example/repo1.git".to_string(),
             commit: "v1.0.0".to_string(),
-            build_depends_on: None,
-            git_depends_on: None,
             build: Some(vec!["make".to_string()]),
-            documentation_dir: None,
+            ..Default::default()
         },
         GitConfig {
             name: "repo2".to_string(),
             url: "https://github.com/example/repo2.git".to_string(),
             commit: "main".to_string(),
             build_depends_on: Some(vec!["repo1".to_string()]),
-            git_depends_on: None,
-            build: None,
-            documentation_dir: None,
+            ..Default::default()
         },
     ];
 
@@ -118,11 +113,56 @@ gits:
 }
 
 #[test]
+fn test_load_config_with_python_deps() {
+    let fixture = TestFixture::new();
+    let config_path = fixture.path().join("sdk.yml");
+
+    // python-deps accepts both a single path (string) and a list of paths.
+    let yaml_content = format!(
+        r#"mirror: {}
+gits:
+  - name: single
+    url: https://example.com/single.git
+    commit: main
+    python-deps: single/requirements.txt
+  - name: multi
+    url: https://example.com/multi.git
+    commit: main
+    python-deps:
+      - multi/requirements.txt
+      - multi/docs/requirements.txt
+  - name: none
+    url: https://example.com/none.git
+    commit: main
+"#,
+        fixture.path().display()
+    );
+
+    fixture.write_file("sdk.yml", &yaml_content);
+
+    let loaded = load_config(&config_path).expect("Should load config with python-deps");
+    assert_eq!(
+        loaded.gits[0].python_deps.as_deref(),
+        Some(&["single/requirements.txt".to_string()][..])
+    );
+    assert_eq!(
+        loaded.gits[1].python_deps.as_deref(),
+        Some(
+            &[
+                "multi/requirements.txt".to_string(),
+                "multi/docs/requirements.txt".to_string()
+            ][..]
+        )
+    );
+    assert!(loaded.gits[2].python_deps.is_none());
+}
+
+#[test]
 fn test_load_config_with_dependencies() {
     let fixture = TestFixture::new();
     let config_path = fixture.path().join("sdk.yml");
 
-    let config = create_complex_sdk_config(fixture.path());
+    let config = create_complex_sdk_config();
     write_sdk_config(&config, &config_path);
 
     let loaded = load_config(&config_path).expect("Should load complex config");
@@ -156,15 +196,41 @@ fn test_load_config_invalid_yaml() {
 }
 
 #[test]
-fn test_load_config_missing_required_fields() {
+fn test_load_config_without_mirror_field() {
     let fixture = TestFixture::new();
     let config_path = fixture.path().join("incomplete.yml");
 
-    // Missing 'mirror' field
+    // 'mirror' is no longer a required manifest field. A config without it
+    // loads successfully; the mirror is resolved separately.
     fixture.write_file("incomplete.yml", "gits: []");
 
-    let result = load_config(&config_path);
-    assert!(result.is_err());
+    let loaded = load_config(&config_path).expect("Config without mirror should load");
+    assert_eq!(loaded.gits.len(), 0);
+}
+
+#[test]
+fn test_load_config_with_null_gits() {
+    let fixture = TestFixture::new();
+    let config_path = fixture.path().join("null-gits.yml");
+
+    // A bare `gits:` key with nothing after it (YAML null) must be treated
+    // as an empty list, not a type-mismatch error.
+    fixture.write_file("null-gits.yml", "gits:\n");
+
+    let loaded = load_config(&config_path).expect("Config with null gits should load");
+    assert_eq!(loaded.gits.len(), 0);
+}
+
+#[test]
+fn test_load_config_with_missing_gits() {
+    let fixture = TestFixture::new();
+    let config_path = fixture.path().join("missing-gits.yml");
+
+    // Omitting the `gits:` key entirely should also default to an empty list.
+    fixture.write_file("missing-gits.yml", "mirror: /tmp/mirror");
+
+    let loaded = load_config(&config_path).expect("Config without gits key should load");
+    assert_eq!(loaded.gits.len(), 0);
 }
 
 #[test]
@@ -172,11 +238,11 @@ fn test_load_core_config() {
     let fixture = TestFixture::new();
     let config_path = fixture.path().join("sdk.yml");
 
-    let config = create_minimal_sdk_config(fixture.path());
+    let config = create_minimal_sdk_config();
     write_sdk_config(&config, &config_path);
 
     let loaded = load_config(&config_path).expect("Should load core config");
-    assert_eq!(loaded.mirror, fixture.path());
+    assert_eq!(loaded.gits.len(), 0);
 }
 
 #[test]
@@ -223,7 +289,7 @@ profiles:
   minimal:
     packages:
       - pyyaml
-  
+
   dev:
     packages:
       - pytest
@@ -243,6 +309,48 @@ default: minimal
 }
 
 #[test]
+fn test_load_python_dependencies_with_requirements() {
+    let fixture = TestFixture::new();
+    let deps_path = fixture.path().join("python-deps.yml");
+
+    // A profile may list requirements.txt paths, with or without inline packages.
+    let deps_yaml = r#"
+profiles:
+  docs:
+    packages:
+      - sphinx
+    requirements:
+      - docs/requirements.txt
+  reqs-only:
+    requirements:
+      - tools/requirements.txt
+
+default: docs
+"#;
+
+    fixture.write_file("python-deps.yml", deps_yaml);
+
+    let loaded = load_python_dependencies(&deps_path).expect("Should load Python dependencies");
+    let docs = loaded.profiles.get("docs").expect("docs profile present");
+    assert_eq!(docs.packages, vec!["sphinx".to_string()]);
+    assert_eq!(
+        docs.requirements.as_deref(),
+        Some(&["docs/requirements.txt".to_string()][..])
+    );
+
+    // Profiles with only requirements (no inline packages) must still parse.
+    let reqs_only = loaded
+        .profiles
+        .get("reqs-only")
+        .expect("reqs-only profile present");
+    assert!(reqs_only.packages.is_empty());
+    assert_eq!(
+        reqs_only.requirements.as_deref(),
+        Some(&["tools/requirements.txt".to_string()][..])
+    );
+}
+
+#[test]
 fn test_config_with_yaml_anchors() {
     let fixture = TestFixture::new();
     let config_path = fixture.path().join("sdk.yml");
@@ -259,7 +367,7 @@ gits:
     url: https://github.com/example/repo1.git
     commit: main
     build: *standard_build
-  
+
   - name: repo2
     url: https://github.com/example/repo2.git
     commit: main
@@ -285,13 +393,12 @@ fn test_config_serialization_roundtrip() {
     let fixture = TestFixture::new();
     let config_path = fixture.path().join("sdk.yml");
 
-    let original = create_complex_sdk_config(fixture.path());
+    let original = create_complex_sdk_config();
     write_sdk_config(&original, &config_path);
 
     let loaded = load_config(&config_path).expect("Should load config");
 
-    // Verify all fields match
-    assert_eq!(loaded.mirror, original.mirror);
+    // Verify all fields match.
     assert_eq!(loaded.gits.len(), original.gits.len());
 
     for (loaded_git, original_git) in loaded.gits.iter().zip(original.gits.iter()) {
@@ -336,11 +443,12 @@ gits:
 }
 
 #[test]
-fn test_config_path_expansion() {
+fn test_legacy_manifest_mirror_key_is_ignored_but_loads() {
     let fixture = TestFixture::new();
     let config_path = fixture.path().join("sdk.yml");
 
-    // Test that environment variable-style paths work
+    // A manifest carrying the legacy `mirror:` key still loads; the key is
+    // simply ignored (mirror is configured via --mirror or the user config).
     let yaml_content = r#"mirror: /tmp/mirror
 gits:
   - name: test
@@ -351,7 +459,8 @@ gits:
     fixture.write_file("sdk.yml", yaml_content);
 
     let loaded = load_config(&config_path).expect("Should load config");
-    assert_eq!(loaded.mirror.to_str().unwrap(), "/tmp/mirror");
+    assert_eq!(loaded.gits.len(), 1);
+    assert_eq!(loaded.gits[0].name, "test");
 }
 
 #[test]
@@ -373,8 +482,8 @@ fn test_user_config_list_all_simple_fields() {
         default_workspace: Some(PathBuf::from("/home/user/workspace")),
         workspace_prefix: Some("myprefix-".to_string()),
         default_source: Some("https://example.com/manifests".to_string()),
+        alternate_sources: None,
         no_mirror: Some(true),
-        docker_temp_dir: Some(PathBuf::from("/tmp/docker")),
         copy_files: None,
         shell: Some("/bin/zsh".to_string()),
         shell_arg: Some("-c".to_string()),
@@ -384,13 +493,12 @@ fn test_user_config_list_all_simple_fields() {
     };
 
     let list = config.list_all();
-    assert_eq!(list.len(), 9);
+    assert_eq!(list.len(), 8);
     assert!(list.contains(&"mirror=/custom/mirror".to_string()));
     assert!(list.contains(&"default_workspace=/home/user/workspace".to_string()));
     assert!(list.contains(&"workspace_prefix=myprefix-".to_string()));
     assert!(list.contains(&"default_source=https://example.com/manifests".to_string()));
     assert!(list.contains(&"no_mirror=true".to_string()));
-    assert!(list.contains(&"docker_temp_dir=/tmp/docker".to_string()));
     assert!(list.contains(&"shell=/bin/zsh".to_string()));
     assert!(list.contains(&"shell_arg=-c".to_string()));
     assert!(list.contains(&"documentation_dirs=docs,manuals".to_string()));
@@ -763,7 +871,7 @@ linux-x86_64:
 "#;
 
     let os_deps: OsDependencies =
-        serde_yaml::from_str(yaml_content).expect("Should parse new format with multiple versions");
+        noyalib::from_str(yaml_content).expect("Should parse new format with multiple versions");
 
     let os_config = os_deps
         .os_configs
@@ -776,10 +884,10 @@ linux-x86_64:
 
     // Verify package lists
     let ubuntu_22 = &os_config.distros["ubuntu-22.04"];
-    assert_eq!(ubuntu_22.package_manager.packages.len(), 2);
+    assert_eq!(ubuntu_22.package_manager.resolved_packages().len(), 2);
 
     let ubuntu_24 = &os_config.distros["ubuntu-24.04"];
-    assert_eq!(ubuntu_24.package_manager.packages.len(), 3);
+    assert_eq!(ubuntu_24.package_manager.resolved_packages().len(), 3);
 }
 
 #[test]
@@ -803,7 +911,7 @@ linux:
       - git
 "#;
 
-    let os_deps: OsDependencies = serde_yaml::from_str(yaml_content)
+    let os_deps: OsDependencies = noyalib::from_str(yaml_content)
         .expect("Should parse legacy format for backward compatibility");
 
     let os_config = os_deps
@@ -849,7 +957,7 @@ linux-x86_64:
 "#;
 
     let os_deps: OsDependencies =
-        serde_yaml::from_str(yaml_content).expect("Should parse mixed format");
+        noyalib::from_str(yaml_content).expect("Should parse mixed format");
 
     let os_config = os_deps
         .os_configs
@@ -885,7 +993,7 @@ linux-x86_64:
 "#;
 
     let os_deps: OsDependencies =
-        serde_yaml::from_str(yaml_content).expect("Should parse distro names with dashes");
+        noyalib::from_str(yaml_content).expect("Should parse distro names with dashes");
 
     let os_config = os_deps
         .os_configs
@@ -907,42 +1015,152 @@ linux-x86_64:
 }
 
 #[test]
-fn test_user_config_mirror_override_priority() {
-    use dsdk_cli::config::UserConfig;
+fn test_os_dependencies_nested_packages_flat_compat() {
+    use dsdk_cli::config::OsDependencies;
+
+    let yaml_content = r#"
+linux-x86_64:
+  ubuntu-24.04:
+    command: "apt install"
+    packages:
+      - git
+      - cmake
+      - build-essential
+"#;
+
+    let os_deps: OsDependencies =
+        noyalib::from_str(yaml_content).expect("Should parse flat packages list");
+
+    let distro = &os_deps.os_configs["linux-x86_64"].distros["ubuntu-24.04"];
+    let packages = distro.package_manager.resolved_packages();
+    assert_eq!(packages.len(), 3);
+    assert!(packages.contains(&"git".to_string()));
+    assert!(packages.contains(&"cmake".to_string()));
+    assert!(packages.contains(&"build-essential".to_string()));
+}
+
+#[test]
+fn test_os_dependencies_nested_packages_composed() {
+    use dsdk_cli::config::OsDependencies;
+
+    // Simulate what YAML anchors expand to: a list of lists
+    let yaml_content = r#"
+linux-x86_64:
+  ubuntu-24.04:
+    command: "apt install"
+    packages:
+      - - git
+        - cmake
+      - - gcc-multilib
+        - g++-multilib
+"#;
+
+    let os_deps: OsDependencies =
+        noyalib::from_str(yaml_content).expect("Should parse nested (composed) packages list");
+
+    let distro = &os_deps.os_configs["linux-x86_64"].distros["ubuntu-24.04"];
+    let packages = distro.package_manager.resolved_packages();
+    assert_eq!(packages.len(), 4);
+    assert!(packages.contains(&"git".to_string()));
+    assert!(packages.contains(&"cmake".to_string()));
+    assert!(packages.contains(&"gcc-multilib".to_string()));
+    assert!(packages.contains(&"g++-multilib".to_string()));
+}
+
+#[test]
+fn test_os_dependencies_nested_packages_dedup() {
+    use dsdk_cli::config::OsDependencies;
+
+    // Both groups contain "git" — should appear only once in the result
+    let yaml_content = r#"
+linux-x86_64:
+  ubuntu-24.04:
+    command: "apt install"
+    packages:
+      - - git
+        - cmake
+      - - git
+        - gcc-multilib
+"#;
+
+    let os_deps: OsDependencies =
+        noyalib::from_str(yaml_content).expect("Should parse nested packages with duplicates");
+
+    let distro = &os_deps.os_configs["linux-x86_64"].distros["ubuntu-24.04"];
+    let packages = distro.package_manager.resolved_packages();
+    assert_eq!(packages.len(), 3, "duplicate 'git' should be removed");
+    assert!(packages.contains(&"git".to_string()));
+    assert!(packages.contains(&"cmake".to_string()));
+    assert!(packages.contains(&"gcc-multilib".to_string()));
+}
+
+#[test]
+fn test_os_dependencies_mixed_flat_and_nested_same_file() {
+    use dsdk_cli::config::OsDependencies;
+
+    // x86_64 uses nested (composed), aarch64 uses flat — both must parse correctly
+    let yaml_content = r#"
+linux-x86_64:
+  ubuntu-24.04:
+    command: "apt install"
+    packages:
+      - - git
+        - cmake
+      - - gcc-multilib
+
+linux-aarch64:
+  ubuntu-24.04:
+    command: "apt install"
+    packages:
+      - git
+      - cmake
+"#;
+
+    let os_deps: OsDependencies =
+        noyalib::from_str(yaml_content).expect("Should parse file with mixed flat and nested");
+
+    let x86_distro = &os_deps.os_configs["linux-x86_64"].distros["ubuntu-24.04"];
+    let x86_pkgs = x86_distro.package_manager.resolved_packages();
+    assert_eq!(x86_pkgs.len(), 3);
+    assert!(x86_pkgs.contains(&"gcc-multilib".to_string()));
+
+    let arm_distro = &os_deps.os_configs["linux-aarch64"].distros["ubuntu-24.04"];
+    let arm_pkgs = arm_distro.package_manager.resolved_packages();
+    assert_eq!(arm_pkgs.len(), 2);
+    assert!(!arm_pkgs.contains(&"gcc-multilib".to_string()));
+}
+
+#[test]
+fn test_resolve_mirror_cli_override_wins() {
+    use dsdk_cli::workspace::resolve_mirror;
+    use std::path::{Path, PathBuf};
+
+    // The --mirror CLI override takes precedence over user config and the
+    // built-in default, regardless of any manifest contents.
+    let resolved = resolve_mirror(Some(Path::new("/explicit/cli/mirror")));
+    assert_eq!(resolved, PathBuf::from("/explicit/cli/mirror"));
+}
+
+#[test]
+fn test_apply_to_sdk_config_no_longer_overrides_mirror() {
+    use dsdk_cli::config::{CopyFileConfig, UserConfig};
 
     let fixture = TestFixture::new();
     let config_path = fixture.path().join("sdk.yml");
 
-    // Create SDK config with one mirror path
-    let sdk_mirror = fixture.path().join("sdk-mirror");
-    let mut config = create_minimal_sdk_config(&sdk_mirror);
-    config.gits = vec![GitConfig {
-        name: "test-repo".to_string(),
-        url: "https://github.com/example/test.git".to_string(),
-        commit: "main".to_string(),
-        build_depends_on: None,
-        git_depends_on: None,
-        build: None,
-        documentation_dir: None,
-    }];
+    let config = create_minimal_sdk_config();
     write_sdk_config(&config, &config_path);
+    let mut loaded_sdk_config = load_config(&config_path).expect("Should load SDK config");
 
-    // Load SDK config
-    let loaded_sdk_config = load_config(&config_path).expect("Should load SDK config");
-    assert_eq!(
-        loaded_sdk_config.mirror, sdk_mirror,
-        "SDK config should have sdk-mirror"
-    );
-
-    // Create user config with different mirror path
-    let user_mirror = fixture.path().join("user-mirror");
-    let user_config = UserConfig {
-        mirror: Some(user_mirror.clone()),
+    // A user config that sets only `mirror` produces no SdkConfig overrides:
+    // the mirror is resolved separately (via resolve_mirror), not applied here.
+    let mirror_only = UserConfig {
+        mirror: Some(fixture.path().join("user-mirror")),
         default_source: None,
+        alternate_sources: None,
         default_workspace: None,
         workspace_prefix: None,
         no_mirror: None,
-        docker_temp_dir: None,
         copy_files: None,
         shell: None,
         shell_arg: None,
@@ -950,47 +1168,14 @@ fn test_user_config_mirror_override_priority() {
         cert_validation: None,
         no_dividers: None,
     };
-
-    // Apply user config overrides to SDK config
-    let mut overridden_sdk_config = loaded_sdk_config.clone();
-    let override_count = user_config.apply_to_sdk_config(&mut overridden_sdk_config, false);
-
-    // Verify that user config mirror overrides SDK config mirror
-    assert_eq!(override_count, 1, "Should have 1 override applied");
     assert_eq!(
-        overridden_sdk_config.mirror, user_mirror,
-        "User config mirror should override SDK config mirror"
+        mirror_only.apply_to_sdk_config(&mut loaded_sdk_config, false),
+        0,
+        "mirror-only user config should apply no SdkConfig overrides"
     );
-    assert_ne!(
-        overridden_sdk_config.mirror, sdk_mirror,
-        "Mirror should not be the SDK default"
-    );
-}
 
-#[test]
-fn test_user_config_mirror_override_with_multiple_overrides() {
-    use dsdk_cli::config::{CopyFileConfig, UserConfig};
-
-    let fixture = TestFixture::new();
-    let config_path = fixture.path().join("sdk.yml");
-
-    // Create SDK config
-    let sdk_mirror = fixture.path().join("sdk-mirror");
-    let config = create_minimal_sdk_config(&sdk_mirror);
-    write_sdk_config(&config, &config_path);
-
-    // Load SDK config
-    let loaded_sdk_config = load_config(&config_path).expect("Should load SDK config");
-
-    // Create user config with multiple overrides
-    let user_mirror = fixture.path().join("user-mirror");
-    let user_config = UserConfig {
-        mirror: Some(user_mirror.clone()),
-        default_source: Some("https://github.com/example/manifests.git".to_string()),
-        default_workspace: Some(fixture.path().join("workspace")),
-        workspace_prefix: Some("test-".to_string()),
-        no_mirror: Some(true),
-        docker_temp_dir: None,
+    // copy_files is still applied by apply_to_sdk_config.
+    let with_copy_files = UserConfig {
         copy_files: Some(vec![CopyFileConfig {
             source: "test.txt".to_string(),
             dest: "test-dest.txt".to_string(),
@@ -999,26 +1184,14 @@ fn test_user_config_mirror_override_with_multiple_overrides() {
             post_data: None,
             symlink: None,
         }]),
-        shell: None,
-        shell_arg: None,
-        documentation_dirs: None,
-        cert_validation: None,
-        no_dividers: None,
+        ..Default::default()
     };
-
-    // Apply user config overrides to SDK config
-    let mut overridden_sdk_config = loaded_sdk_config;
-    let override_count = user_config.apply_to_sdk_config(&mut overridden_sdk_config, false);
-
-    // Verify that user config mirror is applied even with multiple overrides
-    assert!(
-        override_count >= 1,
-        "Should have at least 1 override applied"
-    );
     assert_eq!(
-        overridden_sdk_config.mirror, user_mirror,
-        "User config mirror should override SDK config mirror even with multiple overrides"
+        with_copy_files.apply_to_sdk_config(&mut loaded_sdk_config, false),
+        1,
+        "copy_files user config should still apply one override"
     );
+    assert!(loaded_sdk_config.copy_files.is_some());
 }
 
 #[test]
@@ -1076,4 +1249,85 @@ toolchains:
         toolchains[0].sha256.is_none(),
         "sha256 should be None when not specified"
     );
+}
+
+#[test]
+fn test_extends_absent_by_default() {
+    let fixture = TestFixture::new();
+    let config_path = fixture.path().join("sdk.yml");
+
+    let config = create_minimal_sdk_config();
+    write_sdk_config(&config, &config_path);
+
+    let loaded = load_config(&config_path).expect("Should load config without extends");
+    assert!(loaded.extends.is_none());
+}
+
+#[test]
+fn test_extends_shorthand_with_version() {
+    let fixture = TestFixture::new();
+    let config_path = fixture.path().join("sdk.yml");
+
+    let yaml_content = "gits: []\nextends: platform-sdk@v1.4.0\n";
+    std::fs::write(&config_path, yaml_content).expect("Failed to write config");
+
+    let loaded = load_config(&config_path).expect("Should load config with shorthand extends");
+    let extends = loaded.extends.expect("Should have extends section");
+    assert_eq!(extends.target, "platform-sdk");
+    assert_eq!(extends.version.as_deref(), Some("v1.4.0"));
+    assert!(extends.source.is_none());
+}
+
+#[test]
+fn test_extends_shorthand_without_version() {
+    let fixture = TestFixture::new();
+    let config_path = fixture.path().join("sdk.yml");
+
+    let yaml_content = "gits: []\nextends: platform-sdk\n";
+    std::fs::write(&config_path, yaml_content).expect("Failed to write config");
+
+    let loaded = load_config(&config_path).expect("Should load config with bare shorthand extends");
+    let extends = loaded.extends.expect("Should have extends section");
+    assert_eq!(extends.target, "platform-sdk");
+    assert!(extends.version.is_none());
+    assert!(extends.source.is_none());
+}
+
+#[test]
+fn test_extends_structured_form() {
+    let fixture = TestFixture::new();
+    let config_path = fixture.path().join("sdk.yml");
+
+    let yaml_content = r#"gits: []
+extends:
+  target: platform-sdk
+  version: v1.4.0
+  source: https://github.com/example/other-manifests
+"#;
+    std::fs::write(&config_path, yaml_content).expect("Failed to write config");
+
+    let loaded = load_config(&config_path).expect("Should load config with structured extends");
+    let extends = loaded.extends.expect("Should have extends section");
+    assert_eq!(extends.target, "platform-sdk");
+    assert_eq!(extends.version.as_deref(), Some("v1.4.0"));
+    assert_eq!(
+        extends.source.as_deref(),
+        Some("https://github.com/example/other-manifests")
+    );
+}
+
+#[test]
+fn test_extends_structured_form_without_version() {
+    let fixture = TestFixture::new();
+    let config_path = fixture.path().join("sdk.yml");
+
+    let yaml_content = "gits: []\nextends:\n  target: platform-sdk\n";
+    std::fs::write(&config_path, yaml_content).expect("Failed to write config");
+
+    let loaded =
+        load_config(&config_path).expect("Should load config with minimal structured extends");
+    let extends = loaded.extends.expect("Should have extends section");
+    assert_eq!(extends.target, "platform-sdk");
+    assert!(extends.version.is_none());
+    assert!(extends.source.is_none());
 }

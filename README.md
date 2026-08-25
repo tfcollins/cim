@@ -4,6 +4,8 @@ Code in Motion, also known as `cim`, manages multi-repository SDK workspaces and
 
 Setting up and building an entire project takes just a handful of commands, typically around 5 lines in a shell. The tool standardizes build targets across projects (sdk-xyz commands), so teams don't need to learn different conventions for each software project. Still, advanced users can continue working with the underlying build systems directly if and when needed. The defaults just make the common case easy. `cim` minimizes duplication by letting you share toolchains, workspace components, and git mirrors across multiple projects. Since it is built as a CLI, it works with CI/CD systems like GitHub Actions out of the box. The goal is to deliver production-ready software projects either as standalone projects or in the form of SDKs, both that avoid the struggle with tooling.
 
+This `README.md` is the technical documentation for `cim`. For a more high level overview, the motivations and FAQ, please check the [https://analogdevicesinc.github.io/cim](https://analogdevicesinc.github.io/cim) website.
+
 ## What Problems Does This Solve?
 
 - **Automated setup**: Replace manual README instructions and copy-paste command workflows with a single init command
@@ -90,11 +92,87 @@ Manifests define SDK targets and are stored locally (e.g., `~/devel/cim-manifest
 
 ### List Available Targets
 
+As of now we host a public manifest repository here [https://github.com/joabech/cim-manifests](https://github.com/joabech/cim-manifests) with a various open source and Analog Devices specific targets. This URL will likely move to a different location in the future. In the meantime, you are welcome to contribute to this repository with new targets and improvements to existing ones.
+
 ```bash
 cim list-targets
 cim list-targets --source https://github.com/<path-to-a>/cim-manifests
-cim list-targets --t optee-qemu-v8  # show versions
+cim list-targets -t optee-qemu-v8  # show versions
+cim list-targets --source https://github.com/org/private-manifests --verbose  # diagnose auth issues
 ```
+
+### Authentication for private repositories
+
+`cim` uses the host system's **git** binary for all git operations.
+For public repositories no credentials are needed. For private
+repositories — especially those behind GitHub Enterprise with SAML
+SSO — authentication is handled by git's own credential helpers.
+
+Since `cim` delegates to `git`, any credential method your system git
+supports (Git Credential Manager, SSH agent, credential helpers,
+keychains) works automatically.
+
+Add `--verbose` to any `cim` command to trace which git commands are
+executed.
+
+#### Regular users: gh CLI (recommended for SAML SSO organizations)
+
+`gh auth login` is the recommended setup for any private GitHub
+repository, and the only reliable method for organizations that
+enforce SAML SSO (such as enterprise GitHub organizations).
+
+```bash
+# Install gh: https://cli.github.com
+
+# Authenticate (choose: GitHub.com → HTTPS → Login with a web browser)
+gh auth login
+
+# For a GitHub Enterprise Server host
+gh auth login --hostname github.your-company.com
+```
+
+On Linux, `gh auth login` adds `gh auth git-credential` as a
+credential helper to `~/.gitconfig`. On macOS it stores the OAuth
+token in the system Keychain instead.
+
+For SAML SSO organizations, after logging in you must also authorize
+your token for the org. Visit `https://github.com/settings/tokens`,
+find your token, and click **Configure SSO → Authorize**.
+
+#### SSH
+
+SSH keys bypass the HTTPS credential system entirely and work with
+all GitHub organizations without any SAML SSO setup:
+
+```bash
+# Add your public key at https://github.com/settings/keys
+# then map HTTPS URLs to SSH in ~/.gitconfig:
+[url "git@github.com:org/"]
+    insteadOf = https://github.com/org/
+```
+
+#### CI: GITHUB_TOKEN environment variable
+
+In headless CI environments, set a personal access token with `repo`
+scope. For SAML SSO organizations the token must be authorized for
+the org (visit `https://github.com/settings/tokens` → Configure
+SSO → Authorize).
+
+```bash
+export GITHUB_TOKEN=ghp_...
+cim list-targets --source https://github.com/org/private-manifests
+```
+
+On macOS CI runners, or any system whose `/etc/gitconfig` configures
+a credential helper that could prompt interactively, add:
+
+```bash
+export GIT_CONFIG_NOSYSTEM=1
+export GITHUB_TOKEN=ghp_...
+```
+
+This bypasses the system-level credential helper and ensures
+`GITHUB_TOKEN` is used without any interactive prompts.
 
 ### Initialize a Workspace
 
@@ -108,9 +186,10 @@ Creates workspace at `$HOME/dsdk-optee-qemu-v8`. Use `-w` or `--workspace` to sp
 
 ```bash
 cd ~/dsdk-optee-qemu-v8
-cim makefile         # generate Makefile
-make sdk-build       # build
-make sdk-test        # test
+cim install toolchains   # install toolchains defined in the manifest
+cim makefile             # generate Makefile
+make sdk-build           # build
+make sdk-test            # test
 ```
 
 ---
@@ -122,6 +201,26 @@ make sdk-test        # test
 **Workspace**: A directory with sdk.yml, os-dependencies.yml, python-dependencies.yml, cloned git repos, and a .workspace marker file. Workspaces are isolated.
 
 **Mirror**: Local cache at `$HOME/tmp/mirror` (configurable) for offline operation. Stores downloaded toolchains, files and repo mirrors. Possible to opt out of mirroring with `--no-mirror` or disable in user config.
+
+> **Mirror dependency warning**: Workspaces initialized from a mirror borrow git
+> objects from it via git alternates (`.git/objects/info/alternates`). This
+> means the workspace git history depends on the mirror being present. Your
+> working tree files and any commits you have made locally are always safe, but
+> git operations that traverse history (`git log`, `git checkout <old-sha>`,
+> `git diff HEAD~N`) will fail if the mirror is removed.
+>
+> If the mirror is accidentally deleted, re-running `cim update` restores it
+> and the workspace recovers automatically — no data is lost.
+>
+> If you really want to make a workspace fully self-contained and independent
+> of the mirror, run the following inside each git repository in the workspace:
+>
+> ```bash
+> git fetch --unshallow
+> ```
+>
+> This copies all borrowed objects from the mirror into the workspace itself.
+> From that point the workspace no longer needs the mirror for git operations.
 
 **Target**: Predefined SDK configuration in a manifest repository under `targets/<name>/sdk.yml`.
 
@@ -141,39 +240,149 @@ Initialize workspace from target.
 
 ```bash
 cim init --target NAME [--workspace PATH] [--version VERSION]
-          [--match REGEX] [--install] [--full] [--symlink] [--no-mirror]
+          [--match REGEX] [--include-group NAMES] [--exclude-group NAMES]
+          [--install] [--full] [--symlink] [--no-mirror]
 ```
 
 - `--install`: Install toolchains and pip packages after init
 - `--full`: Complete setup including OS dependencies (requires sudo)
 - `--symlink`: Install to mirror with symlinks in workspace
 - `--match REGEX`: Only clone repos matching pattern
+- `--include-group NAMES`: Only clone repos belonging to these comma-separated group(s)
+- `--exclude-group NAMES`: Skip repos belonging to these comma-separated group(s)
 - `--no-mirror`: Disable mirroring for this workspace
 
 #### update
 
-Update git repos in workspace.
+Update git repos in workspace. By default, if the workspace was created
+with `--match`, only the matched repositories are updated.
 
 ```bash
-cim update [--match REGEX] [--no-mirror]
+cim update [--match REGEX] [--include-group NAMES] [--exclude-group NAMES]
+           [--all] [--no-mirror]
 ```
+
+- `--all`: Update all repositories, ignoring any stored match filter
+  from init. Clears the stored filter so subsequent updates also cover
+  all repositories.
+- `--include-group NAMES` / `--exclude-group NAMES`: same group filtering
+  as `init` (see [Repository Groups](#repository-groups)).
 
 #### makefile
 
-Generate Makefile from sdk.yml (run from workspace).
+Generate Makefile from sdk.yml (run from workspace). Emits standard
+`sdk-*` targets (`sdk-build`, `sdk-test`, `sdk-clean`, `sdk-flash`,
+`sdk-envsetup`) and a target per git repository. Per-git build
+fragment files (`<name>.mk`) are auto-discovered from the directory
+set by `build_folder` (default: `build/`) and added as `-include`
+directives automatically.
 
 ```bash
-cim makefile [--no-dividers]
+cim makefile [--no-dividers] [--include-group NAMES] [--exclude-group NAMES]
 ```
+
+- `--include-group NAMES` / `--exclude-group NAMES`: same group filtering
+  as `init` (see [Repository Groups](#repository-groups)). If neither is
+  passed, the group filter stored in the workspace by `cim init`/`cim
+  update` is reused, so the generated Makefile's git targets and
+  `install-all` step stay consistent with whichever repositories are
+  actually present in the workspace. `install:` steps whose
+  `depends_on_gits` names a git excluded this way are pruned from the
+  Makefile — see `depends_on_gits` in the `install:` section below.
+
+To suppress auto-discovered per-git `build/<name>.mk` fragments for
+specific repositories, add an `exclude` list to the `makefile_include`
+key in `sdk.yml` for that target:
+
+```yaml
+# sdk.yml — suppress build/qemu.mk and build/trusted-services.mk
+makefile_include:
+  files:
+    - include extra.mk   # optional explicit includes
+  exclude:
+    - qemu
+    - trusted-services
+```
+
+The `files` key lists explicit `-include` directives to emit verbatim;
+`exclude` names the repositories whose auto-discovered fragments are
+omitted.  Both keys are optional.  The legacy bare-list form
+(`makefile_include: [include extra.mk]`) remains supported and implies
+no exclusions.
+
+#### Custom Phases
+
+By default, `cim` generates the five standard `sdk-*` targets: `sdk-envsetup`,
+`sdk-build`, `sdk-test`, `sdk-clean`, and `sdk-flash`.  You can extend this list
+with custom phases by adding a `phases:` key to `sdk.yml`:
+
+```yaml
+phases:
+  - deploy
+  - lint
+  - docs
+```
+
+This generates `sdk-deploy`, `sdk-lint`, and `sdk-docs` targets in addition to the
+standard five. Custom phases are implemented via per-repository `.mk` fragments
+in your `build_folder` (default: `build/`). For example, add `build/myrepo.mk`
+with targets like:
+
+```makefile
+myrepo-deploy:
+	@echo "Deploying myrepo..."
+	# deployment commands here
+
+myrepo-lint:
+	@echo "Linting myrepo..."
+	# linting commands here
+```
+
+The Makefile auto-discovers these as `sdk-deploy` and `sdk-lint` overlay targets.
+Custom phases are useful for workflows like deployment, linting, documentation
+generation, or other domain-specific build operations.
 
 #### foreach
 
 Run command in each repo.
 
 ```bash
-cim foreach "COMMAND" [--match REGEX]
+cim foreach "COMMAND" [--match REGEX] [--include-group NAMES] [--exclude-group NAMES]
 # Example: cim foreach "git status"
 ```
+
+#### Repository Groups
+
+Each entry in `gits:` can declare one or more `group:` names:
+
+```yaml
+gits:
+  - name: docs-site
+    url: https://github.com/example/docs-site.git
+    commit: main
+    group: docs   # or a list: group: [docs, optional]
+```
+
+A repository with no `group:` set implicitly belongs to the `default`
+group. `--include-group`/`--exclude-group` (accepted by `init`, `update`,
+`foreach`, `makefile`, and `install pip`) take comma-separated group
+names and filter which repositories are cloned, updated, targeted,
+included in the generated Makefile, or have their per-repo Python deps
+installed:
+
+```bash
+cim init -t my-sdk --include-group docs
+cim init -t my-sdk --exclude-group docs,optional
+```
+
+`--match` (regex on repository name) and `--include-group`/
+`--exclude-group` can be combined; a repository must satisfy both to be
+included.
+
+If a git excluded by group/pattern filtering (or removed by an overlay's
+`gits: remove:`) is named in an `install:` step's `depends_on_gits`, that
+install step is dropped from the generated Makefile too — see
+`depends_on_gits` in the `install:` section below.
 
 #### add
 
@@ -191,12 +400,30 @@ cim add --name NAME --url URL --commit COMMIT
 cim install os-deps [--yes] [--no-sudo] [--yes]
 ```
 
-**pip** - Install Python packages from python-dependencies.yml
+**pip** - Install Python packages
 
 ```bash
 cim install pip [--profile PROFILE] [--symlink] [--force]
+                [--include-group NAMES] [--exclude-group NAMES]
 # Example: cim install pip --profile dev,docs
 ```
+
+This installs from two sources:
+
+- **Per-git deps** declared via `python-deps:` on `gits:` entries in `sdk.yml`,
+  each installed into an isolated venv at `.cim/<git>/.venv`. `--include-group`/
+  `--exclude-group` filter which repositories' deps are installed here (see
+  [Repository Groups](#repository-groups)); if neither is passed, the group
+  filter stored in the workspace by `cim init`/`cim update` is reused, so this
+  never reaches into a checkout that was deliberately excluded and doesn't
+  exist.
+- **Shared workspace deps** from `python-dependencies.yml` profiles, installed
+  into `<workspace>/.venv` (selected with `--profile`). Group filtering does
+  not apply here — these are workspace-wide, not per-repo.
+
+If [`uv`](https://docs.astral.sh/uv/) is on `PATH` it is used as a faster
+backend; otherwise cim falls back to `python3 -m venv` and `pip`. The resulting
+environments are standard venvs either way.
 
 **toolchains** - Download and extract toolchains from sdk.yml
 
@@ -287,6 +514,13 @@ cim utils update
 # Override default manifest source
 default_source = "https://github.com/<a-path-to>/cim-manifests"
 
+# Additional manifest sources (searched after default_source)
+[[alternate_sources]]
+url = "https://github.com/myteam/custom-manifests"
+
+[[alternate_sources]]
+url = "$HOME/devel/local-manifests"
+
 # Override mirror location
 mirror_path = "/custom/mirror"
 
@@ -325,7 +559,7 @@ packages and the python-dependencies.yml defines the Python packages needed
 
 ### Example
 
-Note that this example, isn't a complete manifest, but rather a demonstration of the different sections and features.
+Note that this example, isn't a complete manifest, but rather a demonstration of the different sections and features. See the [Quick Start](#quick-start) section for a public facing manifest repository with various targets.
 
 #### sdk.yml
 ```yaml
@@ -360,6 +594,27 @@ mirror: $HOME/tmp/mirror
 variables:
   SDK_BASE_URL: https://artifacts.example.com/sdk  # literal base URL
   SDK_ARCH: $HOST_ARCH                             # resolved from host env var
+
+
+################################################################################
+# Explicit Makefile includes — appended before auto-discovered fragments.
+# Supports ${{ WORKSPACE }} variable references and plain relative paths.
+################################################################################
+makefile_include:
+  - include ${{ WORKSPACE }}/shared/common.mk
+
+
+################################################################################
+# Optional: directory where per-git build fragment files (<name>.mk) are
+# auto-discovered by "cim makefile" and added as -include directives.
+# Defaults to build/ when absent.
+#
+# Accepted forms:
+#   build_folder: build                   # workspace-relative (default)
+#   build_folder: ${{ WORKSPACE }}/build  # same, portable Make variable
+#   build_folder: /opt/sdk/fragments      # absolute path
+################################################################################
+build_folder: build
 
 
 ################################################################################
@@ -403,18 +658,33 @@ toolchains:
 
 
 ################################################################################
-# Build related commands, these will end up in the Makefile generated
-# by "cim makefile". Although there is no limit on the amount of commands here,
-# it's recommended to keep it minimal and simple, and put more complex logic in
-# a dedicated "build.git" or similar. This is mostly meant to initiate and
+# Build related commands, these will end up in the Makefile generated by "cim
+# makefile". Although there is no limit on the amount of commands here, it's
+# recommended to keep it minimal and simple, and put more complex logic in a
+# dedicated "build.git" or similar. This is mostly meant to initiate and
 # redirect build commands to the different build systems used in the workspace.
 #
-# In the example below, we envision that a there exist a "build" folder, either
-# as a directory or as a "build.git" repository, which contains the actual
-# build logic and Makefiles for the current project.
-# Note that there is no requirement on using "make" and tradtional Makefiles
-# there. You can use any build system you want, as long as you redirect to it
-# from the high level makefile targets defined here.
+# Each section (envsetup, build, test, clean, flash) supports two formats:
+#
+# Object format with optional depends_on:
+#   build:
+#     commands:
+#       - $(MAKE) -C build all $(MAKEFLAGS)
+#     depends_on:
+#       - sdk-envsetup   # run sdk-envsetup before sdk-build in the Makefile
+#
+# Legacy list format (still works, but no recommended, use the above)
+#   build:
+#     - $(MAKE) -C build all $(MAKEFLAGS)
+#
+# depends_on accepts sdk-* target names (sdk-envsetup, sdk-build, sdk-test,
+# sdk-clean, sdk-flash) or git repository target names. This is a Makefile
+# build-time dependency only — it does not affect git clone ordering.
+# Clone ordering is controlled by git_depends_on in the gits section.
+#
+# Note that there is no requirement on using continue to "make" and tradtional
+# Makefiles from here. You can use any build system you want, as long as you
+# redirect to it from the high level makefile targets defined here.
 ################################################################################
 # Environment setup commands, these will typically run before the build and
 # test commands.
@@ -424,9 +694,15 @@ envsetup:
   - ln -sf qemu_v8.mk build/Makefile
   - echo "Building for arch: ${{ SDK_ARCH }}"
 
-# Build commands
+# Build commands — object format showing dependency on sdk-envsetup
 build:
-  - $(MAKE) -C build all $(MAKEFLAGS)
+  commands:
+    - $(MAKE) -C build all $(MAKEFLAGS)
+  depends_on:
+    - sdk-envsetup
+    - platform      # This indicates that the build target for "platform" will
+                    # run before the "sdk-build" will run in the generated
+                    # Makefile
 
 # Test commands
 test:
@@ -467,9 +743,26 @@ copy_files:
 # Triggered by the "install tools" command. Can be used to setup and install
 # arbitrary tools, files and binaries.
 #
-# sentinel: is an optional file that is created after successful installation.
-#           If the sentinel file exists, the installation step will be skipped
-#           on subsequent runs.
+# sentinel: is an optional boolean. If true, a sentinel file
+#           (.cim/<name>-installed) is created after successful installation;
+#           if that file exists, the step is skipped on subsequent runs. The
+#           path is always derived from the step's name -- it cannot be
+#           customized. Omit or set to false to disable sentinel tracking.
+#           For backward compatibility, an arbitrary string (the old way of
+#           specifying a custom sentinel path) is still accepted and treated
+#           as true, except for the literal string "false".
+# depends_on: other install target names that must run first.
+# depends_on_gits: git name(s) (from the gits: section below) this step
+#           needs cloned. If any named git is missing from the final,
+#           effective gits list -- because it was excluded by
+#           --include-group/--exclude-group, or removed by an overlay's
+#           `gits: remove:` -- this install step is dropped from the
+#           generated Makefile's install-all target. Any other install step
+#           that depends_on a dropped step is dropped too (cascading).
+#           Omit this field for steps with no git linkage (e.g. downloading
+#           a standalone tool); such steps always run and are unaffected by
+#           group/overlay git filtering -- the only way to remove them is an
+#           overlay's `install: remove:`.
 ################################################################################
 install:
   - name: protoc
@@ -477,7 +770,14 @@ install:
       @mkdir -p opt/protoc bin
       @cd opt/protoc && unzip -q -o ../../downloads/protoc-21.7-linux-x86_64.zip
       @ln -sf ../opt/protoc/bin/protoc bin/protoc
-    sentinel: .sdk/protoc.installed
+    sentinel: true
+
+  - name: zephyr-python-deps
+    depends_on_gits:
+      - zephyr
+    commands:
+      - . .venv/bin/activate && pip install -r zephyr/scripts/requirements-base.txt
+    sentinel: true
 
 
 ################################################################################
@@ -486,13 +786,28 @@ install:
 # name: encourge to use a single name to keep the git in the workspace root, but
 # it can be nested if needed.
 # build: will generate a Makefile target for this git repository.
-# build_depends_on: ensures the dependent repository is built before this one
+# build_depends_on: ensures the listed targets are built before this repository
 #             in the generated Makefile (also accepts legacy name "depends_on").
-#             It's possible to depend on multiple targets.
+#             Accepts git repository names (e.g. "build") or sdk-* target names
+#             (e.g. "sdk-envsetup"). Multiple targets are allowed. This is a
+#             Makefile build-time dependency only — clone ordering is controlled
+#             separately by git_depends_on.
 # git_depends_on: controls clone ordering. Repositories listed here will be
 #             cloned before this one. Useful for nested repos where a child
-#             path lives inside a parent repo's directory tree.
+#             path lives inside a parent repo's directory tree. (Unrelated to
+#             an install step's depends_on_gits, which links an install: step
+#             to the git(s) it needs -- see the install: section above.)
 # commit: can be a branch, tag, or specific commit hash.
+# python-deps: path(s) to requirements.txt files for this repository's Python
+#             dependencies, relative to the git's own checkout directory.
+#             Accepts a single path or a list. cim install pip creates an
+#             isolated venv for this git at .cim/<name>/.venv and installs the
+#             requirements into it. cim makefile then emits a <NAME>_VENV
+#             variable (e.g. ZEPHYR_VENV) pointing at that venv, so build
+#             fragments can activate it with `. $(ZEPHYR_VENV)/bin/activate`.
+#             Use this for per-repo runtime deps; use python-dependencies.yml
+#             profiles for workspace-wide cim tooling (docs, lint). See
+#             python-dependencies.yml below.
 ################################################################################
 gits:
   - name: build
@@ -507,11 +822,21 @@ gits:
     build_depends_on:
       - build
 
+  # Example: a repository with its own Python dependencies. The path is
+  # relative to the git's checkout, so this resolves to
+  # zephyrproject/zephyr/scripts/requirements.txt. cim installs it into
+  # .cim/zephyrproject/zephyr/.venv and exposes it as $(ZEPHYR_VENV).
+  - name: zephyrproject/zephyr
+    url: https://github.com/zephyrproject-rtos/zephyr.git
+    commit: main
+    python-deps: scripts/requirements.txt
+
   - name: optee_client
     url: https://github.com/OP-TEE/optee_client.git
     commit: master
     build_depends_on:
       - optee_os
+      - sdk-envsetup  # can also depend on sdk-* target names
 
   # Example: nested repositories - the parent must be cloned first so that
   # children can be placed inside its directory tree.
@@ -540,11 +865,14 @@ Here we define the host OS dependencies for different OS'es. If the distros use 
 
 `command:` is the command to install packages for that particular OS/distro. For example, `apt install` for Ubuntu and `dnf install` for Fedora, `brew install` for macOS, `winget` for Windows etc.
 
-`packages:` is the list of packages to install for that particular OS/distro.
+`packages:` is the list of packages to install for that particular OS/distro. It accepts two forms:
+
+- **Flat list** — the standard form: `packages: *anchor` or an inline sequence.
+- **Composed list** — a list of lists, where each element is itself a list (typically a YAML anchor). `cim` flattens and deduplicates all sublists into one install command at runtime. This is useful when a target needs a shared base plus architecture-specific extras, avoiding full list duplication.
 
 ```yaml
 # Common package lists using YAML anchors for DRY
-ubuntu_packages: &ubuntu_pkgs
+ubuntu_packages_base: &ubuntu_packages_base
   - build-essential
   - curl
   - git
@@ -552,7 +880,12 @@ ubuntu_packages: &ubuntu_pkgs
   - python3
   - vim
 
-fedora_packages: &fedora_pkgs
+# x86_64-only packages (no ARM64 equivalents)
+ubuntu_packages_x86_64_extras: &ubuntu_packages_x86_64_extras
+  - gcc-multilib
+  - g++-multilib
+
+fedora_packages: &fedora_packages
   - ccache
   - cmake
   - curl
@@ -564,34 +897,40 @@ fedora_packages: &fedora_pkgs
   - vim
 
 # Linux x86_64 (Intel/AMD) dependencies
+# Composed form: base list + x86_64-specific extras
 linux-x86_64:
   ubuntu-22.04:
     command: "apt-get install"
-    packages: *ubuntu_pkgs
+    packages:
+      - *ubuntu_packages_base
+      - *ubuntu_packages_x86_64_extras
 
   fedora-42:
     command: "dnf install"
-    packages: *fedora_pkgs
+    packages: *fedora_packages
 
 # Linux ARM64 (Apple Silicon, ARM servers) dependencies
+# Flat form: base list only, no multilib packages on ARM64
 linux-aarch64:
   ubuntu-22.04:
     command: "apt-get install"
-    packages: *ubuntu_pkgs
+    packages: *ubuntu_packages_base
 
   fedora-42:
     command: "dnf install"
-    packages: *fedora_pkgs
+    packages: *fedora_packages
 
 # Backward compatibility - generic linux (defaults to x86_64 behavior)
 linux:
   ubuntu-22.04:
     command: "apt-get install"
-    packages: *ubuntu_pkgs
+    packages:
+      - *ubuntu_packages_base
+      - *ubuntu_packages_x86_64_extras
 
   fedora-42:
     command: "dnf install"
-    packages: *fedora_pkgs
+    packages: *fedora_packages
 
 macos:
   macos-any:
@@ -607,14 +946,27 @@ macos:
 ```
 
 #### python-dependencies.yml
-Here we define the Python dependencies and packages needed for the project. Everything defined in here will end up in the `<workspace>/.venv` folder after running `cim install pip`. As can be seen in the example below, we can define different profiles for different purposes. If you don't specify a profile when running the install command, the `default` profile will be used. You can also specify multiple profiles at the same time using the `-p` or `--profile` option.
+Here we define workspace-wide Python dependencies — typically cim tooling such as documentation (sphinx) and linting. Everything defined in here ends up in the shared `<workspace>/.venv` folder after running `cim install pip`. As can be seen in the example below, we can define different profiles for different purposes. If you don't specify a profile when running the install command, the `default` profile will be used. You can also specify multiple profiles at the same time using the `-p` or `--profile` option.
+
+A profile may list inline `packages:` (optionally version-pinned, e.g. `sphinx==7.2.6`) and/or `requirements:` paths to existing `requirements.txt` files, so you don't have to copy pins by hand:
+
+```yaml
+profiles:
+  docs:
+    packages:
+      - sphinx
+    requirements:
+      - docs/requirements.txt
+```
+
+**Where do my Python deps go?** Rule of thumb: if a *repository* ships a `requirements.txt`, declare it via `python-deps:` on that git's `gits:` entry (it gets its own isolated `.cim/<git>/.venv`). If it's *workspace-wide cim tooling* shared across repos, put it in a `python-dependencies.yml` profile (shared `<workspace>/.venv`).
 
 ```yaml
 profiles:
   # Minimal profile - no additional packages
   minimal:
     packages: []
-    
+
   # Documentation profile - packages for building and serving docs
   docs:
     packages:
@@ -622,7 +974,7 @@ profiles:
       - sphinx-rtd-theme
       - myst-parser
       - sphinx-autobuild
-      
+
   # Development profile - docs + development tools
   dev:
     packages:
@@ -633,7 +985,7 @@ profiles:
       - pytest
       - black
       - flake8
-      
+
   # Full profile - everything
   full:
     packages:
@@ -650,6 +1002,106 @@ profiles:
 # Default profile to use when none specified
 default: docs
 ```
+
+### Composing Manifests: `extends:` and `overlay:`
+
+A target's `sdk.yml` can declare `extends: <base-target>` to build on top
+of another target instead of duplicating its whole manifest. This is
+useful when several targets share most of their `gits:`/`toolchains:`/
+`install:`/`copy_files:` content and only differ in a few places.
+
+A derived target's `sdk.yml` carries two distinct kinds of content:
+
+- **New entries** unique to this target: added directly to the normal
+  `gits:`/`toolchains:`/`install:`/`copy_files:`/`variables:` lists/maps,
+  exactly as in a target with no `extends:` at all. Scalar sections
+  (`build`/`test`/`clean`/`flash`/`envsetup`/`build_folder`/`direnv`/
+  `phases`) are plain whole-value overrides of the base's value.
+  `makefile_include:` is the one exception — it's merged additively (see
+  below), not overridden.
+- **`overlay:`** (a key on the same `sdk.yml`): `remove:`/`modify:`
+  operations against content *inherited* from the base. There is no
+  `add:` here — anything new goes directly in the sections above instead.
+
+```yaml
+# sdk.yml
+extends: example        # shorthand form
+# extends: example@v2.0 # shorthand with a pinned version (branch/tag)
+# extends:               # structured form, for a base target that lives
+#   target: example      # in a different manifest source than this one
+#   version: v2.0
+#   source: https://github.com/org/other-manifests
+
+gits:
+  - name: hello-world    # brand new repo, not present in "example"
+    url: https://github.com/octocat/Hello-World.git
+    commit: master
+
+overlay:
+  gits:
+    modify:
+      - name: git-sandbox  # inherited from "example"; only override build:
+        build: |
+          @echo "Custom build message"
+
+  toolchains:
+    remove:
+      - sh.rustup.rs        # drop a toolchain inherited from "example"
+
+  variables:
+    set:
+      GREETING: "Hello!"    # add/override a variable
+    remove:
+      - SOME_INHERITED_VAR
+```
+
+Merge order per list section is always fixed: **remove** (against the
+base only) → **combine** (base-after-removal plus this target's own new
+`sdk.yml` entries — a name/dest collision here is a hard error) →
+**modify** (against the combined result). `remove:`/`modify:` entries
+that don't exist, and `sdk.yml` entries that collide with an inherited
+name, are hard errors rather than silent no-ops.
+
+`makefile_include:` is merged additively rather than treated as a
+whole-value override: the base's `files:`/`exclude:` come first,
+followed by the derived target's own entries, with exact duplicates
+skipped. This matters for a shared base target extended by several
+independent derived targets — e.g. a low-level `platform-sdk` target
+extended by multiple teams' own targets — since each derived target can
+contribute its own `-include` directives and auto-discovery exclusions
+without having to know about or copy forward whatever the base (or any
+other derived target) already set.
+
+`os-dependencies.yml`/`python-dependencies.yml` are also per-level:
+each level of the `extends:` chain can have its own copy (not merged,
+just copied and processed independently), so `cim install os-deps`/
+`cim install pip` install packages from every level found in the
+workspace.
+
+`cim init` never flattens an `extends:` chain to disk — every level's
+original files are copied into the workspace verbatim so they stay
+independently recognizable and re-editable. The originally-requested
+target keeps the bare `sdk.yml`/`os-dependencies.yml`/
+`python-dependencies.yml` names at the workspace root; each ancestor's
+own files are copied into a `.cim/target-overlays/` subfolder (nested
+under the same `.cim/` directory already used for per-git Python venvs)
+with a `<target>-` prefix (e.g. `.cim/target-overlays/example-sdk.yml`,
+`.cim/target-overlays/example-os-dependencies.yml`), keeping the
+workspace root uncluttered:
+
+```bash
+ls -a $HOME/dsdk-overlay-example
+# sdk.yml                     <- overlay-example's own manifest (extends: example,
+#                                including its own overlay: remove/modify diff)
+# os-dependencies.yml         <- overlay-example's own OS package list
+# .cim/target-overlays/
+#   example-sdk.yml            <- example's original manifest, copied verbatim
+#   example-os-dependencies.yml <- example's own OS package list, copied verbatim
+```
+
+See [`targets/overlay-example`](https://github.com/joabech/cim-manifests/tree/main/targets/overlay-example)
+in the public manifests repository for a complete, working example that
+extends `targets/example`.
 
 ---
 
@@ -719,22 +1171,27 @@ cim init --target my-sdk --source ./my-manifests
 
 ### Docker
 
-The `docker create` command generates Dockerfiles for containerized SDK development. The feature is experimental and command options may change in future versions. Since it need cross compiled `cim` binaries for the target, this command can and should only be used from the source code folder of `cim` itself.
+The `docker create` command generates a Dockerfile that downloads `cim`
+from GitHub Releases and runs `cim init` to set up the workspace inside
+the container. It can be run from anywhere — no source tree or
+cross-compilation required.
 
 ```bash
 # Generate Dockerfile
-cim docker create --target optee-qemu-v8 --distro ubuntu:22.04
+cim docker create --target optee-qemu-v8
 
 # Build and run
 docker build -t sdk-dev .
-docker run -it sdk-dev bash
+docker run -it sdk-dev
 ```
 
 Options:
-- `--distro`: Linux distribution (e.g., ubuntu:22.04, fedora:42)
-- `--profile`: Python profile for documentation tools
-- `--force-https`: Convert git URLs to HTTPS (useful for corporate proxies)
-- `--match`: Filter repositories by regex pattern
+- `--target` (`-t`): Target name (required)
+- `--source` (`-s`): Manifest source URL or local path
+- `--version` (`-v`): Target version (branch/tag)
+- `--distro` (`-d`): Base Docker image (default: `ubuntu:22.04`)
+- `--output` (`-o`): Output Dockerfile path (default: `Dockerfile`)
+- `--force` (`-f`): Overwrite existing Dockerfile
 
 ---
 

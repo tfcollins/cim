@@ -9,7 +9,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::GitConfig;
 use crate::git_operations;
 use crate::messages;
 use anyhow::Result;
@@ -72,9 +71,9 @@ pub fn get_mirror_repo_path(mirror_path: &Path, name: &str, url: &str) -> PathBu
         }
 
         // URL mismatch: need a separate mirror directory
-        messages::info(&format!(
+        messages::verbose(&format!(
             "Mirror '{}' exists with a different URL ({}), using separate mirror for {}",
-            name, &existing_url, url
+            name, existing_url, url
         ));
     }
 
@@ -99,56 +98,4 @@ pub fn get_mirror_repo_path(mirror_path: &Path, name: &str, url: &str) -> PathBu
     // If we still have a collision (very unlikely), fall back to org-repo format
     let org_repo = git_operations::extract_org_and_repo(url);
     mirror_path.join(format!("{}-{}", org_repo, hash))
-}
-
-/// Updates a git repository by cloning or fetching from the configured URL.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The repository cannot be cloned or opened
-/// - Network operations fail
-/// - Git operations such as fetch or checkout fail
-pub fn update_git(config: &GitConfig, mirror_path: &Path) -> Result<()> {
-    let repo_path = get_mirror_repo_path(mirror_path, &config.name, &config.url);
-
-    if repo_path.exists() {
-        messages::status(&format!("Fetching {}...", config.name));
-
-        let fetch_result = git_operations::fetch_all(&repo_path)?;
-
-        if !fetch_result.is_success() {
-            messages::error(&format!(
-                "Failed to fetch {}: {}",
-                config.name, fetch_result.stderr
-            ));
-            return Err(anyhow::anyhow!("Git fetch failed"));
-        }
-    } else {
-        messages::status(&format!("Cloning {}...", config.name));
-
-        let clone_result = git_operations::clone_repo(&config.url, &repo_path, None)?;
-
-        if !clone_result.is_success() {
-            messages::error(&format!(
-                "Failed to clone {}: {}",
-                config.name, clone_result.stderr
-            ));
-            return Err(anyhow::anyhow!("Git clone failed"));
-        }
-    }
-
-    messages::status(&format!("Checking out commit/tag: {}", config.commit));
-
-    let checkout_result = git_operations::checkout(&repo_path, &config.commit)?;
-
-    if !checkout_result.is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to checkout {}: {}",
-            config.commit,
-            checkout_result.stderr
-        ));
-    }
-
-    Ok(())
 }

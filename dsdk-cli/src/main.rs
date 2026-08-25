@@ -56,7 +56,12 @@ fn main() {
     };
 
     match command {
-        Commands::ListTargets { source, target } => {
+        Commands::ListTargets {
+            source,
+            target,
+            verbose,
+        } => {
+            messages::set_verbose(*verbose);
             handle_list_targets_command(source.as_deref(), target.as_deref());
         }
         Commands::Init {
@@ -65,8 +70,11 @@ fn main() {
             version,
             workspace,
             no_mirror,
+            mirror,
             force,
             r#match,
+            include_group,
+            exclude_group,
             verbose,
             install,
             full,
@@ -91,8 +99,11 @@ fn main() {
                 version: version.clone(),
                 workspace: workspace.clone(),
                 no_mirror: *no_mirror,
+                mirror: mirror.clone(),
                 force: *force,
                 match_pattern: r#match.as_deref(),
+                include_group: include_group.as_deref(),
+                exclude_group: exclude_group.as_deref(),
                 verbose: *verbose,
                 install: *install,
                 full: *full,
@@ -102,24 +113,46 @@ fn main() {
                 _cert_validation: cert_validation.as_deref(),
             });
         }
-        Commands::Foreach { command, r#match } => {
-            handle_foreach_command(command, r#match.as_deref());
+        Commands::Foreach {
+            command,
+            r#match,
+            include_group,
+            exclude_group,
+        } => {
+            handle_foreach_command(
+                command,
+                r#match.as_deref(),
+                include_group.as_deref(),
+                exclude_group.as_deref(),
+            );
         }
         Commands::Update {
             no_mirror,
+            mirror,
             r#match,
+            include_group,
+            exclude_group,
+            all,
             verbose,
             cert_validation,
         } => {
             handle_update_command(
                 *no_mirror,
+                mirror.clone(),
                 r#match.as_deref(),
+                include_group.as_deref(),
+                exclude_group.as_deref(),
+                *all,
                 *verbose,
                 cert_validation.as_deref(),
             );
         }
-        Commands::Makefile { no_dividers } => {
-            handle_makefile_command(*no_dividers);
+        Commands::Makefile {
+            no_dividers,
+            include_group,
+            exclude_group,
+        } => {
+            handle_makefile_command(*no_dividers, include_group.clone(), exclude_group.clone());
         }
         Commands::Add { name, url, commit } => {
             handle_add_command(name, url, commit);

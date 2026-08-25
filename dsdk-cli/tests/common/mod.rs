@@ -92,6 +92,10 @@ impl MockGitRepo {
         git_operations::config(&repo_path, "user.email", "test@example.com")
             .expect("Failed to configure git user.email");
 
+        // Force LF line endings so tests behave identically on Windows
+        let gitattributes_path = repo_path.join(".gitattributes");
+        fs::write(&gitattributes_path, "* text eol=lf\n").expect("Failed to write .gitattributes");
+
         Self {
             path: repo_path,
             fixture,
@@ -137,105 +141,69 @@ impl MockGitRepo {
     /// Get file:// URL for this repository
     #[allow(dead_code)]
     pub fn file_url(&self) -> String {
-        format!("file://{}", self.path.display())
+        git_operations::path_to_file_url(&self.path)
     }
 }
 
 /// Create a minimal SDK configuration for testing
-pub fn create_minimal_sdk_config(mirror_path: &Path) -> SdkConfig {
+pub fn create_minimal_sdk_config() -> SdkConfig {
     SdkConfig {
-        mirror: mirror_path.to_path_buf(),
         gits: vec![],
-        toolchains: None,
-        install: None,
-        copy_files: None,
-        makefile_include: None,
-        envsetup: None,
-        test: None,
-        clean: None,
-        build: None,
-        flash: None,
-        variables: None,
+        ..Default::default()
     }
 }
 
 /// Create a basic SDK configuration with one repository
 #[allow(dead_code)]
-pub fn create_basic_sdk_config(mirror_path: &Path, repo_url: &str) -> SdkConfig {
+pub fn create_basic_sdk_config(repo_url: &str) -> SdkConfig {
     SdkConfig {
-        mirror: mirror_path.to_path_buf(),
         gits: vec![GitConfig {
             name: "test-repo".to_string(),
             url: repo_url.to_string(),
             commit: "main".to_string(),
-            build_depends_on: None,
-            git_depends_on: None,
             build: Some(vec!["make".to_string()]),
-            documentation_dir: None,
+            ..Default::default()
         }],
-        toolchains: None,
-        install: None,
-        copy_files: None,
-        makefile_include: None,
-        envsetup: None,
-        test: None,
-        clean: None,
-        build: None,
-        flash: None,
-        variables: None,
+        ..Default::default()
     }
 }
 
 /// Create an SDK configuration with multiple repositories and dependencies
-pub fn create_complex_sdk_config(mirror_path: &Path) -> SdkConfig {
+pub fn create_complex_sdk_config() -> SdkConfig {
     SdkConfig {
-        mirror: mirror_path.to_path_buf(),
         gits: vec![
             GitConfig {
                 name: "base-lib".to_string(),
                 url: "https://github.com/example/base-lib.git".to_string(),
                 commit: "v1.0.0".to_string(),
-                build_depends_on: None,
-                git_depends_on: None,
                 build: Some(vec!["make base".to_string()]),
-                documentation_dir: None,
+                ..Default::default()
             },
             GitConfig {
                 name: "middleware".to_string(),
                 url: "https://github.com/example/middleware.git".to_string(),
                 commit: "main".to_string(),
                 build_depends_on: Some(vec!["base-lib".to_string()]),
-                git_depends_on: None,
                 build: Some(vec!["make middleware".to_string()]),
-                documentation_dir: None,
+                ..Default::default()
             },
             GitConfig {
                 name: "application".to_string(),
                 url: "https://github.com/example/application.git".to_string(),
                 commit: "develop".to_string(),
                 build_depends_on: Some(vec!["base-lib".to_string(), "middleware".to_string()]),
-                git_depends_on: None,
                 build: Some(vec!["make app".to_string()]),
-                documentation_dir: None,
+                ..Default::default()
             },
         ],
-        toolchains: None,
-        install: None,
-        copy_files: None,
-        makefile_include: None,
-        envsetup: None,
-        test: None,
-        clean: None,
-        build: None,
-        flash: None,
-        variables: None,
+        ..Default::default()
     }
 }
 
 /// Write an SDK config to a YAML file
 #[allow(dead_code)]
 pub fn write_sdk_config(config: &SdkConfig, path: &Path) {
-    let yaml = serde_yaml::to_string(config).expect("Failed to serialize SDK config");
+    let yaml = noyalib::to_string(config).expect("Failed to serialize SDK config");
     fs::write(path, yaml).expect("Failed to write SDK config file");
 }
 
@@ -306,16 +274,13 @@ mod tests {
 
     #[test]
     fn test_create_minimal_sdk_config() {
-        let fixture = TestFixture::new();
-        let config = create_minimal_sdk_config(fixture.path());
+        let config = create_minimal_sdk_config();
         assert_eq!(config.gits.len(), 0);
-        assert_eq!(config.mirror, fixture.path());
     }
 
     #[test]
     fn test_create_complex_sdk_config() {
-        let fixture = TestFixture::new();
-        let config = create_complex_sdk_config(fixture.path());
+        let config = create_complex_sdk_config();
         assert_eq!(config.gits.len(), 3);
         assert_eq!(config.gits[0].name, "base-lib");
         assert!(config.gits[0].build_depends_on.is_none());

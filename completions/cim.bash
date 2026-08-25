@@ -15,22 +15,24 @@
 # Supports all commands and options:
 #   - list-targets: --source (-s), --target (-t)
 #   - init: --target (-t), --source (-s), --version (-v), --workspace (-w),
-#           --no-mirror, --force, --match, --verbose, --install, --full, --symlink,
-#           --yes (-y), --cert-validation
-#   - update: --no-mirror, --match, --verbose (-v), --cert-validation
-#   - foreach: command, --match
-#   - makefile: --no-dividers
+#           --no-mirror, --mirror, --force, --match, --include-group,
+#           --exclude-group, --verbose, --install, --full, --symlink,
+#           --yes (-y), --cert-validation, --no-includes
+#   - update: --no-mirror, --mirror, --match, --include-group, --exclude-group,
+#             --all, --verbose (-v), --cert-validation
+#   - foreach: command, --match, --include-group, --exclude-group
+#   - makefile: --no-dividers, --include-group, --exclude-group, --no-includes
 #   - add: --name (-n), --url (-u), --commit
 #   - install os-deps: --yes (-y), --no-sudo
-#   - install pip: --profile (-p), --force (-f), --symlink, --list-profiles
+#   - install pip: --profile (-p), --force (-f), --symlink, --list-profiles,
+#                  --include-group, --exclude-group
 #   - install toolchains: --force (-f), --symlink, --verbose (-v), --cert-validation
 #   - install tools: name, --list, --all, --force (-f)
 #   - docs create: --force (-f), --theme, --symlink, --verbose, --cert-validation
 #   - docs build: --format (-f)
 #   - docs serve: --port (-p), --host
 #   - docker create: --target (-t), --source (-s), --version (-v), --distro (-d),
-#                    --profile (-p), --arch (-a), --output (-o), --force (-f),
-#                    --force-https, --force-ssh, --no-mirror, --match (-m)
+#                    --output (-o), --force (-f)
 #   - release: --tag (-t), --genconfig, --include, --exclude, --dry-run
 #   - config: --list (-l), --get (-g), --path (-p), --template (-t), --create (-c),
 #             --force (-f), --edit (-e), --validate (-v)
@@ -59,6 +61,19 @@ _cim_completions() {
     # Function to complete directory paths
     _complete_dir_path() {
         COMPREPLY=( $(compgen -d "${cur}") )
+    }
+
+    # Function to complete group names from gits:/group: entries in sdk.yml,
+    # always offering "default" (the implicit group for entries with no
+    # group: set) as well.
+    _complete_groups() {
+        local groups="default"
+        if [ -f "sdk.yml" ]; then
+            local from_file
+            from_file=$(grep "group:" sdk.yml 2>/dev/null | sed -E 's/.*group:[[:space:]]*//; s/[][,"'"'"']*//g')
+            groups="${groups} ${from_file}"
+        fi
+        COMPREPLY=( $(compgen -W "${groups}" -- "${cur}") )
     }
 
     # Function to complete config files (*.yml, *.yaml)
@@ -167,12 +182,25 @@ _cim_completions() {
                     COMPREPLY=( $(compgen -W "\"optee.*\" \".*test.*\" \"build.*\"" -- "${cur}") )
                     return 0
                     ;;
+                --include-group|--exclude-group)
+                    _complete_groups
+                    return 0
+                    ;;
                 --cert-validation)
                     COMPREPLY=( $(compgen -W "strict relaxed auto" -- "${cur}") )
                     return 0
                     ;;
+                --no-includes)
+                    # Complete common repository names from sdk.yml if available
+                    local repo_names=""
+                    if [ -f "sdk.yml" ]; then
+                        repo_names=$(grep -A1 "^  - name:" sdk.yml 2>/dev/null | grep "name:" | sed 's/.*name: //' | tr '\n' ',')
+                    fi
+                    COMPREPLY=( $(compgen -W "${repo_names}" -- "${cur}") )
+                    return 0
+                    ;;
                 *)
-                    COMPREPLY=( $(compgen -W "--target -t --source -s --version -v --workspace -w --no-mirror --force --match --install --full --symlink --yes -y --verbose --cert-validation --help" -- "${cur}") )
+                    COMPREPLY=( $(compgen -W "--target -t --source -s --version -v --workspace -w --no-mirror --mirror --force --match --include-group --exclude-group --install --full --symlink --yes -y --verbose --cert-validation --no-includes --help" -- "${cur}") )
                     return 0
                     ;;
             esac
@@ -185,12 +213,16 @@ _cim_completions() {
                     COMPREPLY=( $(compgen -W "\"optee.*\" \".*test.*\" \"build.*\"" -- "${cur}") )
                     return 0
                     ;;
+                --include-group|--exclude-group)
+                    _complete_groups
+                    return 0
+                    ;;
                 --cert-validation)
                     COMPREPLY=( $(compgen -W "strict relaxed auto" -- "${cur}") )
                     return 0
                     ;;
                 *)
-                    COMPREPLY=( $(compgen -W "--no-mirror --match --verbose -v --cert-validation --help" -- "${cur}") )
+                    COMPREPLY=( $(compgen -W "--no-mirror --mirror --match --include-group --exclude-group --all --verbose -v --cert-validation --help" -- "${cur}") )
                     return 0
                     ;;
             esac
@@ -203,13 +235,17 @@ _cim_completions() {
                     COMPREPLY=( $(compgen -W "\"optee.*\" \".*test.*\" \"build.*\"" -- "${cur}") )
                     return 0
                     ;;
+                --include-group|--exclude-group)
+                    _complete_groups
+                    return 0
+                    ;;
                 *)
                     # Complete common commands for foreach
                     if [ $COMP_CWORD -eq 2 ]; then
                         local common_commands="\"git status\" \"git pull\" \"git log\" \"git diff\" \"make clean\" ls pwd"
-                        COMPREPLY=( $(compgen -W "${common_commands} --match --help" -- "${cur}") )
+                        COMPREPLY=( $(compgen -W "${common_commands} --match --include-group --exclude-group --help" -- "${cur}") )
                     else
-                        COMPREPLY=( $(compgen -W "--match --help" -- "${cur}") )
+                        COMPREPLY=( $(compgen -W "--match --include-group --exclude-group --help" -- "${cur}") )
                     fi
                     return 0
                     ;;
@@ -217,8 +253,25 @@ _cim_completions() {
             ;;
 
         makefile)
-            COMPREPLY=( $(compgen -W "--no-dividers --help" -- "${cur}") )
-            return 0
+            case "${prev}" in
+                --no-includes)
+                    # Complete common repository names from sdk.yml if available
+                    local repo_names=""
+                    if [ -f "sdk.yml" ]; then
+                        repo_names=$(grep -A1 "^  - name:" sdk.yml 2>/dev/null | grep "name:" | sed 's/.*name: //' | tr '\n' ',')
+                    fi
+                    COMPREPLY=( $(compgen -W "${repo_names}" -- "${cur}") )
+                    return 0
+                    ;;
+                --include-group|--exclude-group)
+                    _complete_groups
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=( $(compgen -W "--no-dividers --include-group --exclude-group --no-includes --help" -- "${cur}") )
+                    return 0
+                    ;;
+            esac
             ;;
 
         add)
@@ -253,11 +306,15 @@ _cim_completions() {
                         COMPREPLY=( $(compgen -W "minimal docs dev full" -- "${cur}") )
                         return 0
                         ;;
+                    --include-group|--exclude-group)
+                        _complete_groups
+                        return 0
+                        ;;
                     pip)
-                        COMPREPLY=( $(compgen -W "--profile -p --force -f --symlink --list-profiles --help" -- "${cur}") )
+                        COMPREPLY=( $(compgen -W "--profile -p --force -f --symlink --list-profiles --include-group --exclude-group --help" -- "${cur}") )
                         ;;
                     *)
-                        COMPREPLY=( $(compgen -W "--profile -p --force -f --symlink --list-profiles --help" -- "${cur}") )
+                        COMPREPLY=( $(compgen -W "--profile -p --force -f --symlink --list-profiles --include-group --exclude-group --help" -- "${cur}") )
                         ;;
                 esac
             elif [ "${COMP_WORDS[2]}" = "toolchains" ]; then
@@ -374,25 +431,12 @@ _cim_completions() {
                                 COMPREPLY=( $(compgen -W "ubuntu:20.04 ubuntu:22.04 ubuntu:24.04 fedora:39 fedora:40 fedora:41 fedora:42 debian:11 debian:12 centos:7 centos:8" -- "${cur}") )
                                 return 0
                                 ;;
-                            -p|--profile)
-                                COMPREPLY=( $(compgen -W "minimal docs dev full" -- "${cur}") )
-                                return 0
-                                ;;
-                            -a|--arch)
-                                COMPREPLY=( $(compgen -W "aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu x86_64-pc-windows-gnu" -- "${cur}") )
-                                return 0
-                                ;;
                             -o|--output)
                                 _complete_file_path
                                 return 0
                                 ;;
-                            -m|--match)
-                                # Common regex patterns
-                                COMPREPLY=( $(compgen -W "\"optee.*\" \".*test.*\" \"build.*\"" -- "${cur}") )
-                                return 0
-                                ;;
                             *)
-                                COMPREPLY=( $(compgen -W "--target -t --source -s --version -v --distro -d --profile -p --arch -a --output -o --force -f --force-https --force-ssh --no-mirror --match -m --help" -- "${cur}") )
+                                COMPREPLY=( $(compgen -W "--target -t --source -s --version -v --distro -d --output -o --force -f --help" -- "${cur}") )
                                 return 0
                                 ;;
                         esac
@@ -423,7 +467,7 @@ _cim_completions() {
             case "${prev}" in
                 --get|-g)
                     # Complete config key names
-                    COMPREPLY=( $(compgen -W "default_source docker_temp_dir cert_validation default_workspace workspace_prefix mirror_path documentation_dirs" -- "${cur}") )
+                    COMPREPLY=( $(compgen -W "default_source cert_validation default_workspace workspace_prefix mirror_path documentation_dirs" -- "${cur}") )
                     return 0
                     ;;
                 *)

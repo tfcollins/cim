@@ -10,35 +10,27 @@
 // limitations under the License.
 
 use crate::cli::InstallCommand;
-use dsdk_cli::workspace::{get_current_workspace, load_config_with_user_overrides};
+use crate::init_cmd::{filter_git_configs_by_group, parse_group_list};
+use dsdk_cli::workspace::{
+    get_current_workspace, load_config_with_user_overrides, require_workspace_config,
+    resolve_mirror, WorkspaceMarker, OS_DEPS_FILE, PYTHON_DEPS_FILE, WORKSPACE_MARKER_FILE,
+};
 use dsdk_cli::{config, messages, toolchain_manager};
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// Install system dependencies based on the type specified
 pub(crate) fn handle_install_command(install_command: &InstallCommand) {
-    // Must be run from within a workspace
-    let workspace_path = match get_current_workspace() {
-        Ok(path) => path,
+    let (workspace_path, config_path) = match require_workspace_config() {
+        Ok(paths) => paths,
         Err(e) => {
-            messages::error(&format!("Error: {}", e));
+            messages::error(&e);
             return;
         }
     };
 
-    // Use sdk.yml from workspace root
-    let config_path = workspace_path.join("sdk.yml");
-    if !config_path.exists() {
-        messages::error(&format!(
-            "sdk.yml not found in workspace root: {}",
-            workspace_path.display()
-        ));
-        messages::error("The workspace may be corrupted. Try running 'cim init' to reinitialize.");
-        return;
-    }
-
     // Load SDK config with user config overrides applied
-    let _sdk_config = match load_config_with_user_overrides(&config_path, false) {
+    let sdk_config = match load_config_with_user_overrides(&config_path, false) {
         Ok(config) => config,
         Err(e) => {
             messages::error(&format!(
@@ -52,18 +44,9 @@ pub(crate) fn handle_install_command(install_command: &InstallCommand) {
 
     match install_command {
         InstallCommand::OsDeps { yes, no_sudo } => {
-            // Look for os-dependencies.yml file in workspace (copied via copy_files)
-            let os_deps_path = workspace_path.join("os-dependencies.yml");
-            if os_deps_path.exists() {
-                match config::load_os_dependencies(&os_deps_path) {
-                    Ok(os_deps) => {
-                        install_prerequisites(&os_deps, *yes, *no_sudo);
-                    }
-                    Err(e) => {
-                        messages::error(&format!("Failed to load os-dependencies.yml: {}", e));
-                    }
-                }
-            } else {
+            // Process every os-dependencies.yml-family file in the workspace:
+            // the primary target's own file, plus one per extends: ancestor.
+            if !install_os_deps_from_workspace(&workspace_path, *yes, *no_sudo) {
                 messages::error("os-dependencies.yml not found in workspace.");
                 messages::error("This file is copied automatically during 'cim init'.");
             }
@@ -73,31 +56,97 @@ pub(crate) fn handle_install_command(install_command: &InstallCommand) {
             symlink,
             profile,
             list_profiles,
+            include_group,
+            exclude_group,
         } => {
-            // Look for python-dependencies.yml file in workspace (copied via copy_files)
-            let python_deps_path = workspace_path.join("python-dependencies.yml");
-            if python_deps_path.exists() {
-                // Show available profiles if user requested the list
-                if *list_profiles {
-                    list_available_profiles(&python_deps_path);
-                    return;
-                }
+            let python_deps_files =
+                dsdk_cli::workspace::discover_dependency_files(&workspace_path, PYTHON_DEPS_FILE);
 
-                // Mirror path already expanded in _sdk_config with user overrides applied
-                if let Err(e) = install_python_packages_from_file(
-                    &python_deps_path,
-                    *force,
-                    *symlink,
-                    profile.as_deref(),
-                    &workspace_path,
-                    &_sdk_config.mirror,
-                ) {
+            // Show available profiles if user requested the list
+            if *list_profiles {
+                if python_deps_files.is_empty() {
+                    messages::error("python-dependencies.yml not found in workspace.");
+                } else {
+                    for path in &python_deps_files {
+                        messages::status(&format!("--- {} ---", path.display()));
+                        list_available_profiles(path);
+                    }
+                }
+                return;
+            }
+
+            // Determine group selection: CLI flags take precedence over the
+            // group selection stored in the workspace marker by
+            // `cim init`/`cim update`, so per-repo Python deps aren't
+            // installed for repos that were excluded and never cloned.
+            let (effective_include, effective_exclude): (Option<String>, Option<String>) =
+                if include_group.is_some() || exclude_group.is_some() {
+                    (include_group.clone(), exclude_group.clone())
+                } else {
+                    let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
+                    if marker_path.exists() {
+                        match std::fs::read_to_string(&marker_path) {
+                            Ok(content) => {
+                                let marker = noyalib::from_str::<WorkspaceMarker>(&content).ok();
+                                (
+                                    marker.as_ref().and_then(|m| m.include_groups.clone()),
+                                    marker.as_ref().and_then(|m| m.exclude_groups.clone()),
+                                )
+                            }
+                            Err(_) => (None, None),
+                        }
+                    } else {
+                        (None, None)
+                    }
+                };
+            let include_groups = effective_include
+                .as_deref()
+                .map(parse_group_list)
+                .unwrap_or_default();
+            let exclude_groups = effective_exclude
+                .as_deref()
+                .map(parse_group_list)
+                .unwrap_or_default();
+            let filtered_gits =
+                filter_git_configs_by_group(&sdk_config.gits, &include_groups, &exclude_groups);
+
+            // Per-repo Python deps declared in sdk.yml gits: entries are installed
+            // into isolated venvs at .cim/<git>/.venv, independent of the shared
+            // workspace venv populated from python-dependencies.yml profiles.
+            for git in &filtered_gits {
+                if let Some(reqs) = &git.python_deps {
+                    if let Err(e) =
+                        install_git_python_deps(&workspace_path, &git.name, reqs, *force)
+                    {
+                        messages::error(&format!(
+                            "Failed to install Python deps for '{}': {}",
+                            git.name, e
+                        ));
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            // Shared workspace venv from every python-dependencies.yml-family
+            // file (docs, lint, and other workspace-wide cim tooling).
+            match install_pip_from_workspace(
+                &workspace_path,
+                *force,
+                *symlink,
+                profile.as_deref(),
+                &resolve_mirror(None),
+            ) {
+                Ok(true) => {}
+                Ok(false) if !filtered_gits.iter().any(|g| g.python_deps.is_some()) => {
+                    // Nothing to do from either source: report the missing profiles file.
+                    messages::error("python-dependencies.yml not found in workspace.");
+                    messages::error("This file is copied automatically during 'cim init'.");
+                }
+                Ok(false) => {}
+                Err(e) => {
                     messages::error(&format!("Failed to install Python packages: {}", e));
                     std::process::exit(1);
                 }
-            } else {
-                messages::error("python-dependencies.yml not found in workspace.");
-                messages::error("This file is copied automatically during 'cim init'.");
             }
         }
         InstallCommand::Toolchains {
@@ -109,15 +158,15 @@ pub(crate) fn handle_install_command(install_command: &InstallCommand) {
             // Set verbose mode for messages module
             dsdk_cli::messages::set_verbose(*verbose);
 
-            // Use _sdk_config that already has user overrides applied and mirror expanded
+            // Resolve mirror from user config / built-in default.
             // Create toolchain manager and install toolchains
             let toolchain_manager = toolchain_manager::ToolchainManager::new(
                 workspace_path.clone(),
-                _sdk_config.mirror.clone(),
+                resolve_mirror(None),
             );
 
             if let Err(e) = toolchain_manager.install_toolchains(
-                _sdk_config.toolchains.as_ref(),
+                sdk_config.toolchains.as_ref(),
                 *force,
                 *symlink,
                 cert_validation.as_deref(),
@@ -131,21 +180,21 @@ pub(crate) fn handle_install_command(install_command: &InstallCommand) {
             all,
             force,
         } => {
-            // Use _sdk_config that already has user overrides applied
+            // Use sdk_config that already has user overrides applied
             // Check if install section exists
-            if _sdk_config.install.is_none() || _sdk_config.install.as_ref().unwrap().is_empty() {
+            if sdk_config.install.is_none() || sdk_config.install.as_ref().unwrap().is_empty() {
                 messages::error("No install section found in sdk.yml");
                 messages::info("The install section defines components that can be installed.");
                 return;
             }
 
-            let install_configs = _sdk_config.install.as_ref().unwrap();
+            let install_configs = sdk_config.install.as_ref().unwrap();
 
             // Handle --list flag
             if *list {
                 messages::status("Available install targets:");
                 for install_cfg in install_configs {
-                    let sentinel_info = if let Some(ref sentinel) = install_cfg.sentinel {
+                    let sentinel_info = if let Some(sentinel) = install_cfg.sentinel_path() {
                         format!(" (sentinel: {})", sentinel)
                     } else {
                         String::new()
@@ -188,7 +237,7 @@ pub(crate) fn handle_install_command(install_command: &InstallCommand) {
                         .iter()
                         .find(|cfg| cfg.name == *component_name)
                     {
-                        if let Some(ref sentinel) = install_cfg.sentinel {
+                        if let Some(sentinel) = install_cfg.sentinel_path() {
                             let sentinel_path = workspace_path.join(sentinel);
                             if sentinel_path.exists() {
                                 if let Err(e) = std::fs::remove_file(&sentinel_path) {
@@ -290,27 +339,7 @@ impl VenvManager {
             }
         }
 
-        messages::status(&format!(
-            "Creating Python virtual environment at {}...",
-            venv_path.display()
-        ));
-
-        let output = std::process::Command::new("python3")
-            .args(["-m", "venv"])
-            .arg(&venv_path)
-            .current_dir(&self.workspace_path)
-            .output()?;
-
-        if !output.status.success() {
-            return Err(format!(
-                "Failed to create virtual environment:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
-        }
-
-        messages::success("Virtual environment created successfully");
-        Ok(())
+        run_python_venv_creation(&self.workspace_path)
     }
 
     /// Create virtual environment in mirror and symlink to workspace
@@ -385,23 +414,7 @@ impl VenvManager {
                 std::fs::create_dir_all(parent)?;
             }
 
-            messages::status(&format!(
-                "Creating Python virtual environment in mirror at {}...",
-                mirror_venv_path.display()
-            ));
-
-            let output = std::process::Command::new("python3")
-                .args(["-m", "venv"])
-                .arg(&mirror_venv_path)
-                .output()?;
-
-            if !output.status.success() {
-                return Err(format!(
-                    "Failed to create mirror virtual environment:\n{}",
-                    String::from_utf8_lossy(&output.stderr)
-                )
-                .into());
-            }
+            run_python_venv_creation(&self.mirror_path)?;
         }
 
         // Create symlink from workspace to mirror
@@ -463,40 +476,133 @@ impl VenvManager {
     }
 }
 
-/// Check if virtual environment exists in workspace
+/// Get the platform-specific path to the venv's bin/Scripts directory.
+pub(crate) fn get_venv_bin_dir(workspace_path: &Path) -> PathBuf {
+    workspace_path.join(".venv").join({
+        #[cfg(windows)]
+        {
+            "Scripts"
+        }
+
+        #[cfg(not(windows))]
+        {
+            "bin"
+        }
+    })
+}
+
+/// Get the platform-specific Python executable path inside the venv.
+pub(crate) fn get_venv_python_path(workspace_path: &Path) -> PathBuf {
+    get_venv_bin_dir(workspace_path).join({
+        #[cfg(windows)]
+        {
+            "python.exe"
+        }
+
+        #[cfg(not(windows))]
+        {
+            "python3"
+        }
+    })
+}
+
+/// Check if a virtual environment exists in the workspace.
 pub(crate) fn venv_exists(workspace_path: &Path) -> bool {
     let venv_path = workspace_path.join(".venv");
-    venv_path.exists() && venv_path.join("bin").join("python3").exists()
+    venv_path.exists() && get_venv_python_path(workspace_path).exists()
 }
 
-/// Get the path to the virtual environment's pip executable
-pub(crate) fn get_venv_pip_path(workspace_path: &Path) -> PathBuf {
-    workspace_path.join(".venv").join("bin").join("pip")
-}
-
-/// Create a Python virtual environment in the workspace
-pub(crate) fn create_virtual_environment(
-    workspace_path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let venv_path = workspace_path.join(".venv");
-
-    if venv_exists(workspace_path) {
-        messages::info(&format!(
-            "Virtual environment already exists at {}",
-            venv_path.display()
-        ));
-        return Ok(());
+/// Get the platform-specific Python interpreter command.
+fn python_command() -> &'static str {
+    if cfg!(windows) {
+        "python"
+    } else {
+        "python3"
     }
+}
+
+/// Resolve the absolute path of the system Python interpreter that the stdlib
+/// venv path would use, so the uv backend can be pinned to the same one.
+///
+/// Returns `None` if the interpreter cannot be located, in which case uv falls
+/// back to its own interpreter discovery.
+fn resolve_system_python() -> Option<PathBuf> {
+    let output = std::process::Command::new(python_command())
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+/// Check whether the `uv` binary is available on PATH.
+///
+/// When present, uv is used as a faster, drop-in backend for creating virtual
+/// environments and installing packages. uv produces a standard PEP 405 venv,
+/// so the resulting environment is interchangeable with one created by
+/// `python3 -m venv`. When absent, cim falls back to the stdlib venv + pip path.
+fn uv_available() -> bool {
+    std::process::Command::new("uv")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Create a Python venv at the given path
+fn run_python_venv_creation(workspace_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let venv_path = workspace_path.join(".venv");
 
     messages::status(&format!(
         "Creating Python virtual environment at {}...",
         venv_path.display()
     ));
 
-    let output = std::process::Command::new("python3")
+    // Prefer uv when available: `uv venv` creates a standard venv. By default
+    // uv does not install pip into it (it expects callers to use `uv pip
+    // install`), but the generated Makefiles activate the venv and invoke
+    // plain `pip install`, so pip must be physically present. `--seed`
+    // installs pip/setuptools/wheel, matching the ensurepip step the stdlib
+    // fallback below performs.
+    //
+    // Pin the interpreter to the same `python3` the stdlib fallback would use.
+    // Without `--python`, uv applies its own discovery and may prefer a
+    // uv-managed CPython download over the system interpreter, producing a venv
+    // on a different Python version than the fallback path — defeating the
+    // "identical with or without uv" guarantee.
+    if uv_available() {
+        let mut command = std::process::Command::new("uv");
+        command.arg("venv").arg("--seed");
+        if let Some(python) = resolve_system_python() {
+            command.arg("--python").arg(python);
+        }
+        let output = command.arg(&venv_path).output()?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "Failed to create virtual environment with uv:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+
+        messages::success("Virtual environment created successfully");
+        return Ok(());
+    }
+
+    // Create the venv.
+    let output = std::process::Command::new(python_command())
         .args(["-m", "venv"])
-        .arg(&venv_path)
-        .current_dir(workspace_path)
+        .arg(venv_path)
         .output()?;
 
     if !output.status.success() {
@@ -507,8 +613,50 @@ pub(crate) fn create_virtual_environment(
         .into());
     }
 
+    // Determine the python executable inside the newly-created venv
+    let venv_python = get_venv_python_path(workspace_path);
+
+    // Bootstrap pip inside the venv
+    let ensurepip_output = std::process::Command::new(&venv_python)
+        .args(["-m", "ensurepip"])
+        .output()?;
+
+    if !ensurepip_output.status.success() {
+        return Err(format!(
+            "Failed ensure pip in virtual environment:\n{}",
+            String::from_utf8_lossy(&ensurepip_output.stderr)
+        )
+        .into());
+    }
+    let upgrade_pip_output = std::process::Command::new(&venv_python)
+        .args(["-m", "pip", "install", "pip", "--upgrade"])
+        .output()?;
+
+    if !upgrade_pip_output.status.success() {
+        return Err(format!(
+            "Failed to upgrade pip in virtual environment:\n{}",
+            String::from_utf8_lossy(&upgrade_pip_output.stderr)
+        )
+        .into());
+    }
+
     messages::success("Virtual environment created successfully");
     Ok(())
+}
+
+/// Create a Python virtual environment in the workspace
+pub(crate) fn create_virtual_environment(
+    workspace_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if venv_exists(workspace_path) {
+        messages::info(&format!(
+            "Virtual environment already exists at {}",
+            workspace_path.display()
+        ));
+        return Ok(());
+    }
+
+    run_python_venv_creation(workspace_path)
 }
 
 /// Detect if we're running in a container environment
@@ -546,10 +694,12 @@ pub(crate) fn ensure_docs_dependencies(
 
     // Check if virtual environment exists and has sphinx-build
     if venv_exists(workspace_path) {
-        let sphinx_build_path = workspace_path
-            .join(".venv")
-            .join("bin")
-            .join("sphinx-build");
+        let sphinx_build_name = if cfg!(windows) {
+            "sphinx-build.exe"
+        } else {
+            "sphinx-build"
+        };
+        let sphinx_build_path = get_venv_bin_dir(workspace_path).join(sphinx_build_name);
         if sphinx_build_path.exists() {
             // Virtual environment exists and has sphinx, we're good
             return Ok(());
@@ -562,7 +712,7 @@ pub(crate) fn ensure_docs_dependencies(
     create_virtual_environment(workspace_path)?;
 
     // Install required packages
-    let python_deps_path = workspace_path.join("python-dependencies.yml");
+    let python_deps_path = workspace_path.join(PYTHON_DEPS_FILE);
 
     // Load Python dependencies configuration and determine which profile to use
     let (packages, profile_source) = match config::load_python_dependencies(&python_deps_path) {
@@ -615,17 +765,12 @@ pub(crate) fn ensure_docs_dependencies(
     Ok(())
 }
 
-/// Helper function to install pip packages
-pub(crate) fn install_pip_packages(
-    packages: &[String],
+/// Resolve a workspace path from an optional override, falling back to the
+/// current workspace, and verify a virtual environment exists in it. Returns
+/// the resolved workspace path alongside its venv's python interpreter.
+fn resolve_venv_python(
     workspace_path_override: Option<&Path>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if packages.is_empty() {
-        messages::info("No Python packages to install");
-        return Ok(());
-    }
-
-    // Get workspace path - either from parameter or auto-detect
+) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
     let workspace_path = match workspace_path_override {
         Some(path) => path.to_path_buf(),
         None => match get_current_workspace() {
@@ -638,40 +783,73 @@ pub(crate) fn install_pip_packages(
         },
     };
 
-    // Use virtual environment pip if available
     if !venv_exists(&workspace_path) {
         return Err(
             "Could not finish setting up Python packages: virtual environment not found".into(),
         );
     }
 
-    let venv_pip = get_venv_pip_path(&workspace_path);
-    messages::verbose(&format!(
-        "Using virtual environment pip: {}",
-        venv_pip.display()
-    ));
-    messages::status(&format!(
-        "Running: {} install {}",
-        venv_pip.display(),
-        packages.join(" ")
-    ));
+    let venv_python = get_venv_python_path(&workspace_path);
+    Ok((workspace_path, venv_python))
+}
 
-    let status = std::process::Command::new(&venv_pip)
-        .arg("install")
-        .arg("--trusted-host")
-        .arg("pypi.org")
-        .arg("--trusted-host")
-        .arg("pypi.python.org")
-        .arg("--trusted-host")
-        .arg("files.pythonhosted.org")
-        .args(packages)
-        .status()
-        .map_err(|e| {
-            format!(
-                "Could not finish setting up Python packages: failed to execute pip: {}",
-                e
-            )
-        })?;
+/// Run a pip install into the given venv with the supplied trailing arguments
+/// (package specifiers and/or `-r <file>` pairs). Prefers `uv` when available,
+/// otherwise invokes pip directly inside the venv with the trusted-host flags.
+///
+/// `cwd` is set as the subprocess's working directory. This matters because
+/// requirements files may contain local relative-path package specs and both
+/// `uv` and `pip` resolve such paths relative to the invoking process's cwd,
+/// not relative to the requirements file's own location. Without pinning `cwd`
+/// explicitly, resolution would depend on whatever directory the user happened
+/// to invoke `cim` from.
+fn run_pip_install(
+    venv_python: &Path,
+    install_args: &[String],
+    cwd: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = if uv_available() {
+        messages::status(&format!(
+            "Running: uv pip install --python {} {}",
+            venv_python.display(),
+            install_args.join(" ")
+        ));
+        std::process::Command::new("uv")
+            .args(["pip", "install", "--python"])
+            .arg(venv_python)
+            .args(install_args)
+            .current_dir(cwd)
+            .status()
+            .map_err(|e| {
+                format!(
+                    "Could not finish setting up Python packages: failed to execute uv: {}",
+                    e
+                )
+            })?
+    } else {
+        messages::status(&format!(
+            "Running: {} -m pip install {}",
+            venv_python.display(),
+            install_args.join(" ")
+        ));
+        std::process::Command::new(venv_python)
+            .args(["-m", "pip", "install"])
+            .arg("--trusted-host")
+            .arg("pypi.org")
+            .arg("--trusted-host")
+            .arg("pypi.python.org")
+            .arg("--trusted-host")
+            .arg("files.pythonhosted.org")
+            .args(install_args)
+            .current_dir(cwd)
+            .status()
+            .map_err(|e| {
+                format!(
+                    "Could not finish setting up Python packages: failed to execute pip: {}",
+                    e
+                )
+            })?
+    };
 
     if !status.success() {
         return Err(format!(
@@ -681,7 +859,144 @@ pub(crate) fn install_pip_packages(
         .into());
     }
 
+    Ok(())
+}
+
+/// Helper function to install pip packages
+pub(crate) fn install_pip_packages(
+    packages: &[String],
+    workspace_path_override: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if packages.is_empty() {
+        messages::info("No Python packages to install");
+        return Ok(());
+    }
+
+    let (workspace_path, venv_python) = resolve_venv_python(workspace_path_override)?;
+    messages::verbose(&format!(
+        "Using virtual environment python: {}",
+        venv_python.display()
+    ));
+
+    run_pip_install(&venv_python, packages, &workspace_path)?;
+
     messages::success("Successfully installed Python packages in virtual environment");
+    Ok(())
+}
+
+/// Build the trailing `-r <abs-path>` arguments for a list of requirements
+/// files, resolving each path relative to the workspace root. Returns an error
+/// if any file is missing.
+fn build_requirements_args(
+    requirements: &[String],
+    workspace_path: &Path,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut install_args: Vec<String> = Vec::with_capacity(requirements.len() * 2);
+    for req in requirements {
+        let req_path = workspace_path.join(req);
+        if !req_path.exists() {
+            return Err(format!(
+                "Could not finish setting up Python packages: requirements file not found: {}",
+                req_path.display()
+            )
+            .into());
+        }
+        install_args.push("-r".to_string());
+        install_args.push(req_path.to_string_lossy().into_owned());
+    }
+    Ok(install_args)
+}
+
+/// Install packages listed in one or more `requirements.txt` files into the
+/// workspace virtual environment. Paths are resolved relative to the workspace
+/// root. Missing files are reported as errors.
+pub(crate) fn install_pip_requirements(
+    requirements: &[String],
+    workspace_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if requirements.is_empty() {
+        return Ok(());
+    }
+
+    let (_, venv_python) = resolve_venv_python(Some(workspace_path))?;
+    let install_args = build_requirements_args(requirements, workspace_path)?;
+
+    messages::verbose(&format!(
+        "Using virtual environment python: {}",
+        venv_python.display()
+    ));
+
+    run_pip_install(&venv_python, &install_args, workspace_path)?;
+
+    messages::success("Successfully installed Python requirements in virtual environment");
+    Ok(())
+}
+
+/// Create (or reuse) an isolated virtual environment for a single git and
+/// install its `requirements.txt` files into it.
+///
+/// The venv lives at `<workspace>/.cim/<git-name>/.venv` (see
+/// [`dsdk_cli::workspace::git_venv_path`]). Requirement paths are resolved
+/// relative to the git's own checkout directory (`<workspace>/<git-name>`), so
+/// `python-deps: scripts/requirements.txt` refers to the file inside that
+/// repository. With `force`, an existing venv is recreated.
+pub(crate) fn install_git_python_deps(
+    workspace_path: &Path,
+    git_name: &str,
+    requirements: &[String],
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if requirements.is_empty() {
+        return Ok(());
+    }
+
+    // Validate requirements files up front before any venv side effects.
+    // Paths are relative to the git's checkout directory.
+    let git_checkout = workspace_path.join(git_name);
+    let install_args = build_requirements_args(requirements, &git_checkout)?;
+
+    // The venv primitives take a base directory and append `.venv`, so the
+    // base for this git's venv is the parent of git_venv_path(..).
+    let venv_path = dsdk_cli::workspace::git_venv_path(workspace_path, git_name);
+    let venv_base = venv_path
+        .parent()
+        .expect("git_venv_path always has a parent")
+        .to_path_buf();
+
+    if venv_path.exists() {
+        if force {
+            messages::info(&format!(
+                "Virtual environment for '{}' exists, removing due to --force",
+                git_name
+            ));
+            std::fs::remove_dir_all(&venv_path)?;
+        } else {
+            messages::info(&format!(
+                "Virtual environment for '{}' already exists at {}, reusing (use --force to reinstall)",
+                git_name,
+                venv_path.display()
+            ));
+        }
+    }
+
+    std::fs::create_dir_all(&venv_base)?;
+
+    if !venv_exists(&venv_base) {
+        run_python_venv_creation(&venv_base)?;
+    }
+
+    let venv_python = get_venv_python_path(&venv_base);
+    messages::status(&format!(
+        "Installing Python requirements for '{}' into {}",
+        git_name,
+        venv_path.display()
+    ));
+    run_pip_install(&venv_python, &install_args, workspace_path)?;
+
+    messages::success(&format!(
+        "Successfully installed Python requirements for '{}'",
+        git_name
+    ));
     Ok(())
 }
 
@@ -775,11 +1090,6 @@ pub(crate) fn install_python_packages_from_file(
         .into());
     }
 
-    messages::status(&format!(
-        "Installing Python packages from {}...",
-        python_deps_path.display()
-    ));
-
     // Create VenvManager for virtual environment operations
     let venv_manager = VenvManager::new(workspace_path.to_path_buf(), mirror_path.to_path_buf());
 
@@ -798,19 +1108,28 @@ pub(crate) fn install_python_packages_from_file(
         ));
     }
 
-    // Collect unique packages from all specified profiles
+    // Collect unique packages and requirements files from all specified profiles
     use std::collections::HashSet;
     let mut all_packages = HashSet::new();
+    let mut requirements: Vec<String> = Vec::new();
 
     for profile_name in &profile_names {
         if let Some(profile) = python_deps.profiles.get(*profile_name) {
             for package in &profile.packages {
                 all_packages.insert(package.clone());
             }
+            if let Some(reqs) = &profile.requirements {
+                for req in reqs {
+                    if !requirements.contains(req) {
+                        requirements.push(req.clone());
+                    }
+                }
+            }
             messages::verbose(&format!(
-                "Profile '{}' adds {} package(s)",
+                "Profile '{}' adds {} package(s) and {} requirements file(s)",
                 profile_name,
-                profile.packages.len()
+                profile.packages.len(),
+                profile.requirements.as_ref().map_or(0, |r| r.len()),
             ));
         }
     }
@@ -819,7 +1138,7 @@ pub(crate) fn install_python_packages_from_file(
     let mut packages: Vec<String> = all_packages.into_iter().collect();
     packages.sort();
 
-    if packages.is_empty() {
+    if packages.is_empty() && requirements.is_empty() {
         if profile_names.len() == 1 {
             messages::info(&format!(
                 "Profile '{}' has no packages to install",
@@ -834,17 +1153,109 @@ pub(crate) fn install_python_packages_from_file(
         return Ok(());
     }
 
-    messages::status(&format!(
-        "Installing {} unique package(s) from {} profile(s)",
-        packages.len(),
-        profile_names.len()
-    ));
+    if !packages.is_empty() {
+        messages::status(&format!(
+            "Installing {} unique package(s) from {} profile(s)",
+            packages.len(),
+            profile_names.len()
+        ));
+        install_pip_packages(&packages, Some(workspace_path))?;
+    }
 
-    install_pip_packages(&packages, Some(workspace_path))?;
+    if !requirements.is_empty() {
+        messages::status(&format!(
+            "Installing {} requirements file(s) from {} profile(s)",
+            requirements.len(),
+            profile_names.len()
+        ));
+        install_pip_requirements(&requirements, workspace_path)?;
+    }
+
     Ok(())
 }
 
+/// Returns the flag that makes the given package manager command
+/// non-interactive (skip its own confirmation prompt), if known.
+fn non_interactive_flag(command: &str) -> Option<&'static str> {
+    match command.split_whitespace().next()? {
+        "apt-get" | "apt" | "dnf" | "yum" | "zypper" => Some("-y"),
+        "pacman" => Some("--noconfirm"),
+        _ => None,
+    }
+}
+
 /// Install prerequisites based on OS dependencies configuration
+/// Install OS dependencies from every `os-dependencies.yml`-family file
+/// found in the workspace: the primary target's own file, plus one for
+/// every `extends:` ancestor that contributed one (`<target>-os-dependencies.yml`,
+/// copied in verbatim by `cim init`; see `workspace::discover_dependency_files`).
+///
+/// These files are not merged/overlay-able -- each is installed from in
+/// full, independently. Running the underlying package manager command more
+/// than once (e.g. `brew install`/`apt install` for both the primary and an
+/// inherited file) is expected and harmless.
+///
+/// Returns `true` if at least one file was found and processed.
+pub(crate) fn install_os_deps_from_workspace(
+    workspace_path: &Path,
+    skip_prompt: bool,
+    no_sudo: bool,
+) -> bool {
+    let files = dsdk_cli::workspace::discover_dependency_files(workspace_path, OS_DEPS_FILE);
+    if files.is_empty() {
+        return false;
+    }
+
+    for path in &files {
+        messages::status(&format!(
+            "Installing OS dependencies from {}",
+            path.display()
+        ));
+        match config::load_os_dependencies(path) {
+            Ok(os_deps) => install_prerequisites(&os_deps, skip_prompt, no_sudo),
+            Err(e) => messages::error(&format!("Failed to load {}: {}", path.display(), e)),
+        }
+    }
+    true
+}
+
+/// Install Python packages from every `python-dependencies.yml`-family file
+/// found in the workspace, mirroring `install_os_deps_from_workspace`
+/// above: the primary target's own file plus one per `extends:` ancestor
+/// that contributed one. Each file's own `default:` profile is used unless
+/// `profile_override` is given, in which case it's applied to every file
+/// (falling back to that file's own profiles only if present in it).
+///
+/// Returns `true` if at least one file was found and processed.
+pub(crate) fn install_pip_from_workspace(
+    workspace_path: &Path,
+    force: bool,
+    symlink: bool,
+    profile_override: Option<&str>,
+    mirror_path: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let files = dsdk_cli::workspace::discover_dependency_files(workspace_path, PYTHON_DEPS_FILE);
+    if files.is_empty() {
+        return Ok(false);
+    }
+
+    for path in &files {
+        messages::status(&format!(
+            "Installing Python packages from {}",
+            path.display()
+        ));
+        install_python_packages_from_file(
+            path,
+            force,
+            symlink,
+            profile_override,
+            workspace_path,
+            mirror_path,
+        )?;
+    }
+    Ok(true)
+}
+
 pub(crate) fn install_prerequisites(
     os_deps: &config::OsDependencies,
     skip_prompt: bool,
@@ -899,7 +1310,7 @@ pub(crate) fn install_prerequisites(
             ));
 
             // Display packages to be installed (sorted alphabetically)
-            let mut packages = distro_config.package_manager.packages.clone();
+            let mut packages = distro_config.package_manager.resolved_packages();
             packages.sort();
             messages::status("\nPackages to be installed:");
             for package in &packages {
@@ -942,6 +1353,14 @@ pub(crate) fn install_prerequisites(
                 messages::status("\nProceeding with installation (--yes flag specified)...");
             }
 
+            // Determine the package manager's non-interactive flag, if any,
+            // so `--yes` also suppresses the package manager's own prompt.
+            let non_interactive_flag = if skip_prompt {
+                non_interactive_flag(&distro_config.package_manager.command)
+            } else {
+                None
+            };
+
             // Build the full command with sudo if needed
             let mut cmd_parts: Vec<String> = Vec::new();
 
@@ -969,6 +1388,9 @@ pub(crate) fn install_prerequisites(
 
             // Add packages to install
             let mut all_args = initial_args;
+            if let Some(flag) = non_interactive_flag {
+                all_args.push(flag.to_string());
+            }
             all_args.extend(packages.iter().cloned());
 
             if cmd_parts.is_empty() {
@@ -1094,6 +1516,18 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[test]
+    fn test_non_interactive_flag() {
+        assert_eq!(non_interactive_flag("apt-get install"), Some("-y"));
+        assert_eq!(non_interactive_flag("apt install"), Some("-y"));
+        assert_eq!(non_interactive_flag("dnf install"), Some("-y"));
+        assert_eq!(non_interactive_flag("yum install"), Some("-y"));
+        assert_eq!(non_interactive_flag("zypper install"), Some("-y"));
+        assert_eq!(non_interactive_flag("pacman -S"), Some("--noconfirm"));
+        assert_eq!(non_interactive_flag("brew install"), None);
+        assert_eq!(non_interactive_flag(""), None);
+    }
+
     // Test helper function to create a temporary workspace
     fn create_test_workspace() -> (TempDir, PathBuf) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1104,13 +1538,12 @@ mod tests {
     #[test]
     fn test_venv_exists_true() {
         let (_temp_dir, workspace_path) = create_test_workspace();
-        let venv_path = workspace_path.join(".venv");
-        let bin_path = venv_path.join("bin");
-        fs::create_dir_all(&bin_path).expect("Failed to create venv structure");
+        let bin_dir = get_venv_bin_dir(&workspace_path);
+        fs::create_dir_all(&bin_dir).expect("Failed to create venv structure");
 
         // Create python3 executable (empty file is fine for test)
-        let python_exe = bin_path.join("python3");
-        fs::write(&python_exe, "").expect("Failed to create python3 file");
+        let python_exe = get_venv_python_path(&workspace_path);
+        fs::write(&python_exe, "").expect("Failed to create python file");
 
         assert!(venv_exists(&workspace_path));
     }
@@ -1124,13 +1557,6 @@ mod tests {
         let venv_path = workspace_path.join(".venv");
         fs::create_dir_all(&venv_path).expect("Failed to create venv dir");
         assert!(!venv_exists(&workspace_path));
-    }
-
-    #[test]
-    fn test_get_venv_pip_path() {
-        let (_temp_dir, workspace_path) = create_test_workspace();
-        let expected_pip_path = workspace_path.join(".venv").join("bin").join("pip");
-        assert_eq!(get_venv_pip_path(&workspace_path), expected_pip_path);
     }
 
     #[test]
@@ -1181,13 +1607,6 @@ mod tests {
     fn test_venv_path_helpers() {
         let (_temp_dir, workspace_path) = create_test_workspace();
 
-        // Test pip path generation
-        let pip_path = get_venv_pip_path(&workspace_path);
-        assert_eq!(
-            pip_path,
-            workspace_path.join(".venv").join("bin").join("pip")
-        );
-
         // Test venv detection with non-existent venv
         assert!(!venv_exists(&workspace_path));
 
@@ -1197,10 +1616,28 @@ mod tests {
         assert!(!venv_exists(&workspace_path)); // Still false, no python3
 
         // Test venv detection with complete structure
-        let bin_dir = venv_dir.join("bin");
+        let bin_dir = get_venv_bin_dir(&workspace_path);
         fs::create_dir_all(&bin_dir).expect("Failed to create bin dir");
-        let python_exe = bin_dir.join("python3");
-        fs::write(&python_exe, "").expect("Failed to create python3");
+        let python_exe = get_venv_python_path(&workspace_path);
+        fs::write(&python_exe, "").expect("Failed to create python");
         assert!(venv_exists(&workspace_path)); // Now true
+    }
+
+    #[test]
+    fn test_venv_python_has_virtual_env_set() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+
+        run_python_venv_creation(&workspace_path).expect("Failed to create virtual environment");
+
+        // Under venv, prefix refers to the venv prefix. The base_prefix
+        // does not change, and always points to the base Python installation
+        // https://docs.python.org/3/library/sys.html#sys.base_prefix
+        let venv_python = get_venv_python_path(&workspace_path);
+        let output = std::process::Command::new(&venv_python)
+            .args(["-c", "import sys; assert sys.prefix != sys.base_prefix"])
+            .output()
+            .expect("Failed to assert Python prefix");
+
+        assert!(output.status.success());
     }
 }

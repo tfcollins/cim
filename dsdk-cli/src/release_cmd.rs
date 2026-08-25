@@ -14,11 +14,16 @@ use dsdk_cli::download::{
     DownloadConfig,
 };
 use dsdk_cli::workspace::{
-    copy_dir_recursive, expand_config_mirror_path, expand_env_vars, expand_manifest_vars,
-    get_current_workspace, is_url, resolve_config_source_dir_from_marker, resolve_variables,
+    copy_dir_recursive, expand_env_vars, expand_manifest_vars_in_config, is_url,
+    load_config_with_user_overrides, require_workspace_config,
+    resolve_config_source_dir_from_marker, resolve_mirror,
 };
+
+#[cfg(test)]
+use dsdk_cli::workspace::SDK_CONFIG_FILE;
 use dsdk_cli::{config, git_operations, messages};
 use regex::Regex;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -31,24 +36,13 @@ pub(crate) fn handle_release_command(
     dry_run: bool,
 ) {
     // Must be run from within a workspace
-    let workspace_path = match get_current_workspace() {
-        Ok(path) => path,
+    let (workspace_path, config_path) = match require_workspace_config() {
+        Ok(paths) => paths,
         Err(e) => {
-            messages::error(&format!("Error: {}", e));
+            messages::error(&e);
             return;
         }
     };
-
-    // Use sdk.yml from workspace root
-    let config_path = workspace_path.join("sdk.yml");
-    if !config_path.exists() {
-        messages::error(&format!(
-            "sdk.yml not found in workspace root: {}",
-            workspace_path.display()
-        ));
-        messages::error("The workspace may be corrupted. Try running 'cim init' to reinitialize.");
-        return;
-    }
 
     // Validate arguments
     if tag.is_none() && !genconfig {
@@ -73,13 +67,42 @@ pub(crate) fn handle_release_command(
         messages::status("DRY RUN: No actual changes will be made");
     }
 
-    let sdk_config = match config::load_config(&config_path) {
+    let sdk_config = match load_config_with_user_overrides(&config_path, false) {
         Ok(config) => config,
         Err(e) => {
             messages::error(&format!("Error loading config: {}", e));
             return;
         }
     };
+
+    // If this workspace's sdk.yml declares extends:, the base target's own
+    // gits are already pinned via the explicit extends: version and are
+    // released independently, under the base target's own scheme. A
+    // derived target's release therefore only touches gits it actually
+    // owns: the ones it added directly in its own sdk.yml, or modified via
+    // its own overlay: key. Inherited, unmodified base gits are left
+    // completely untouched (not tagged, not frozen). This is a no-op
+    // (owned_names stays None) for the large majority of targets that
+    // don't use extends: at all.
+    let extends_scope = match load_extends_owned_entries(&config_path) {
+        Ok(scope) => scope,
+        Err(e) => {
+            messages::error(&e);
+            return;
+        }
+    };
+    let owned_names: Option<HashSet<String>> =
+        extends_scope.map(|(base_target, _raw_primary, owned)| {
+            messages::status(&format!(
+                "This target extends '{}': release only affects the {} git(s) \
+             owned by this target (added directly in its own sdk.yml, or \
+             modified via its own overlay: key); inherited gits are released \
+             independently by the base target.",
+                base_target,
+                owned.gits.len()
+            ));
+            owned.gits
+        });
 
     // Helper function to convert multiple patterns into a combined regex
     let build_combined_regex = |patterns: &Vec<String>, pattern_type: &str| -> Option<Regex> {
@@ -142,6 +165,20 @@ pub(crate) fn handle_release_command(
         }
 
         for git_cfg in &sdk_config.gits {
+            // If this target extends: a base, skip any git not owned by
+            // this target's own overlay: key (it's managed by the base
+            // target's independent release instead).
+            if let Some(ref owned) = owned_names {
+                if !owned.contains(&git_cfg.name) {
+                    messages::info(&format!(
+                        "Skipping {} (inherited from base target, not owned by this overlay)",
+                        git_cfg.name
+                    ));
+                    skipped_repos.push(git_cfg.name.clone());
+                    continue;
+                }
+            }
+
             // Check if this repository should be included (if include pattern is specified)
             if let Some(ref regex) = include_regex {
                 if !regex.is_match(&git_cfg.name) {
@@ -175,11 +212,10 @@ pub(crate) fn handle_release_command(
             }
 
             // Check if tag already exists
-            let tag_check = git_operations::list_tags(&repo_path, Some(tag_str));
-
-            match tag_check {
-                Ok(tags) => {
-                    if !tags.is_empty() {
+            let tag_ref = format!("refs/tags/{}", tag_str);
+            match git_operations::ls_remote(&git_cfg.url, false, true) {
+                Ok(refs) => {
+                    if refs.iter().any(|(_, r)| r == &tag_ref) {
                         messages::info(&format!(
                             "Warning: Tag '{}' already exists in {}",
                             tag_str, git_cfg.name
@@ -230,6 +266,12 @@ pub(crate) fn handle_release_command(
             messages::status("\nWould generate release configuration file");
         } else {
             messages::status("\nGenerating release configuration file...");
+            // Freeze the primary sdk.yml's own gits: list, plus -- for an
+            // extends: target -- any inherited gits its own overlay: key
+            // modifies (nested overlay: gits: modify: entries). Both live in
+            // the same sdk.yml file now, so a single freeze pass over it
+            // (see freeze_gits_commits) handles both sections in one output
+            // file.
             if let Err(e) = generate_release_config(
                 &config_path,
                 tag,
@@ -310,6 +352,7 @@ pub(crate) fn generate_release_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the original config file
     let original_content = std::fs::read_to_string(config_path)?;
+    let workspace_path = config_path.parent().unwrap();
 
     // Determine output filename based on the scenario
     let output_filename = match tag {
@@ -329,31 +372,91 @@ pub(crate) fn generate_release_config(
             "sdk_release.yml".to_string()
         }
     };
-    let output_path = config_path.parent().unwrap().join(&output_filename);
+    let output_path = workspace_path.join(&output_filename);
 
-    // Parse and modify the YAML content
+    let modified_content = freeze_gits_commits(
+        &original_content,
+        workspace_path,
+        tag,
+        skipped_repos,
+        tagged_repos,
+    );
+
+    // Write the modified content to the output file
+    std::fs::write(&output_path, modified_content)?;
+
+    messages::success(&format!(
+        "Generated release config: {}",
+        output_path.display()
+    ));
+    Ok(())
+}
+
+/// If the workspace's sdk.yml declares `extends:`, read its own `overlay:`
+/// key (if present) and return `(base_target_name, raw_primary_sdk_config,
+/// owned_entries)`. Returns `None` for a plain (non-extends) target -- the
+/// vast majority of workspaces. The raw primary config is returned too so
+/// callers can inspect exactly what this target's own sdk.yml declares.
+///
+/// Used by every command that must scope its effect (or its writes back to
+/// disk) to only what a derived target's own manifest actually controls:
+/// `cim release` and `cim utils hash-toolchains`/`hash-copy-files`.
+pub(crate) fn load_extends_owned_entries(
+    config_path: &Path,
+) -> Result<Option<(String, config::SdkConfig, dsdk_cli::overlay::OwnedEntries)>, String> {
+    let raw_primary =
+        config::load_config(config_path).map_err(|e| format!("Error loading config: {}", e))?;
+    let Some(extends) = raw_primary.extends.clone() else {
+        return Ok(None);
+    };
+
+    let overlay_config = raw_primary.overlay.clone().unwrap_or_default();
+    let owned = dsdk_cli::overlay::compute_owned_entries(&raw_primary, &overlay_config);
+    Ok(Some((extends.target, raw_primary, owned)))
+}
+
+/// Line-scan `content` for `gits:` section(s) and freeze each entry's
+/// `commit:` value: to `tag` (if provided and the repo was actually tagged,
+/// or unconditionally when no include/exclude patterns were used), or
+/// otherwise to the repository's current commit hash. All other lines,
+/// comments, and formatting are preserved verbatim.
+///
+/// Section boundaries are tracked by indentation rather than a fixed column,
+/// so this correctly freezes both a top-level `gits:` list and, for an
+/// `extends:` target, the nested `overlay: gits: modify:` list further down
+/// the same sdk.yml -- a section ends at the first later non-blank line
+/// whose indentation is less than or equal to its own `gits:` line.
+fn freeze_gits_commits(
+    content: &str,
+    workspace_path: &Path,
+    tag: Option<&str>,
+    skipped_repos: &[String],
+    tagged_repos: &[String],
+) -> String {
     let mut modified_content = String::new();
     let mut in_gits_section = false;
+    let mut gits_indent = 0usize;
     let mut current_git_name: Option<String> = None;
 
-    for line in original_content.lines() {
+    for line in content.lines() {
         let trimmed = line.trim();
+        let indent = line.len() - line.trim_start().len();
 
-        // Check if we're entering the gits section
+        // Check if we're leaving the current gits section (a sibling or
+        // parent key at the same or lower indentation as the `gits:` line
+        // that opened it).
+        if in_gits_section && !trimmed.is_empty() && indent <= gits_indent {
+            in_gits_section = false;
+        }
+
+        // Check if we're entering a gits section (top-level, or nested
+        // under `overlay:`).
         if trimmed == "gits:" {
             in_gits_section = true;
+            gits_indent = indent;
             modified_content.push_str(line);
             modified_content.push('\n');
             continue;
-        }
-
-        // Check if we're leaving the gits section (new top-level section)
-        if in_gits_section
-            && !line.starts_with(' ')
-            && !line.starts_with('\t')
-            && !trimmed.is_empty()
-        {
-            in_gits_section = false;
         }
 
         if in_gits_section {
@@ -382,28 +485,27 @@ pub(crate) fn generate_release_config(
                                 tag_str.to_string()
                             } else {
                                 // Get current commit hash for untagged repos
-                                get_current_commit_hash(
-                                    &config_path.parent().unwrap().join(git_name),
-                                )
-                                .unwrap_or_else(|| {
-                                    trimmed
-                                        .strip_prefix("commit:")
-                                        .unwrap_or("main")
-                                        .trim()
-                                        .to_string()
-                                })
+                                get_current_commit_hash(&workspace_path.join(git_name))
+                                    .unwrap_or_else(|| {
+                                        trimmed
+                                            .strip_prefix("commit:")
+                                            .unwrap_or("main")
+                                            .trim()
+                                            .to_string()
+                                    })
                             }
                         }
                     } else {
                         // genconfig-only mode: always get current commit hash
-                        get_current_commit_hash(&config_path.parent().unwrap().join(git_name))
-                            .unwrap_or_else(|| {
+                        get_current_commit_hash(&workspace_path.join(git_name)).unwrap_or_else(
+                            || {
                                 trimmed
                                     .strip_prefix("commit:")
                                     .unwrap_or("main")
                                     .trim()
                                     .to_string()
-                            })
+                            },
+                        )
                     };
                     modified_content.push_str(&format!(
                         "{}commit: {}",
@@ -424,14 +526,7 @@ pub(crate) fn generate_release_config(
         modified_content.push('\n');
     }
 
-    // Write the modified content to the output file
-    std::fs::write(&output_path, modified_content)?;
-
-    messages::success(&format!(
-        "Generated release config: {}",
-        output_path.display()
-    ));
-    Ok(())
+    modified_content
 }
 
 pub(crate) fn ensure_file_in_mirror(
@@ -479,53 +574,42 @@ pub(crate) fn ensure_file_in_mirror(
 }
 
 /// Update sdk.yml with computed SHA256 hash for a specific copy_files entry
-pub(crate) fn update_sdk_yaml_hash(
+/// Update or insert a sha256 hash for a YAML entry in a config file.
+///
+/// The `entry_matcher` closure receives (line_index, trimmed_line_content) for each line
+/// and should return `true` when it finds the entry whose sha256 should be updated.
+/// It also receives a mutable reference to a range end so it can indicate where to
+/// start looking for the sha256 field.
+fn update_yaml_entry_hash(
     config_path: &Path,
-    dest_or_source: &str,
+    entry_name: &str,
+    entry_type: &str,
     new_hash: &str,
     dry_run: bool,
     add_missing: bool,
+    entry_matcher: impl Fn(&[&str], usize) -> bool,
 ) -> Result<Option<bool>, Box<dyn std::error::Error>> {
     let mut content = fs::read_to_string(config_path)?;
 
-    // Find the copy_files entry matching the destination or source
     let lines: Vec<&str> = content.lines().collect();
     let mut found_entry = false;
     let mut updated_line_idx = None;
-    // Track the start of the matched entry block for --add-missing insertion
     let mut entry_start_idx: Option<usize> = None;
 
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if !found_entry
-            && (trimmed.starts_with("- source:")
-                || trimmed.starts_with("- url:")
-                || trimmed == "source:"
-                || trimmed == "url:")
-        {
-            // Check next few lines for matching dest or source
-            for j in idx..std::cmp::min(idx + 5, lines.len()) {
-                let check_line = lines[j];
-                if check_line.contains(&format!("dest: {}", dest_or_source))
-                    || (check_line.contains("source:") && check_line.contains(dest_or_source))
-                {
-                    // Found the entry - mark as found
-                    found_entry = true;
-                    entry_start_idx = Some(idx);
+    for (idx, _line) in lines.iter().enumerate() {
+        if !found_entry && entry_matcher(&lines, idx) {
+            found_entry = true;
+            entry_start_idx = Some(idx);
 
-                    // Now find sha256 line within this entry
-                    for (k, sha_line) in lines
-                        .iter()
-                        .enumerate()
-                        .take(std::cmp::min(j + 10, lines.len()))
-                        .skip(j)
-                    {
-                        if sha_line.trim().starts_with("sha256:") {
-                            updated_line_idx = Some(k);
-                            break;
-                        }
-                    }
-                    // Break inner loop once we've found the matching entry
+            // Find sha256 line within this entry (scan up to 15 lines ahead)
+            for (k, sha_line) in lines
+                .iter()
+                .enumerate()
+                .take(std::cmp::min(idx + 15, lines.len()))
+                .skip(idx)
+            {
+                if sha_line.trim().starts_with("sha256:") {
+                    updated_line_idx = Some(k);
                     break;
                 }
             }
@@ -533,11 +617,10 @@ pub(crate) fn update_sdk_yaml_hash(
     }
 
     if !found_entry {
-        return Err(format!("Could not find copy_files entry for: {}", dest_or_source).into());
+        return Err(format!("Could not find {} entry for: {}", entry_type, entry_name).into());
     }
 
     if let Some(line_idx) = updated_line_idx {
-        // Extract current hash value from the line
         let current_line = lines[line_idx];
         let current_hash_in_file = current_line
             .trim()
@@ -545,9 +628,7 @@ pub(crate) fn update_sdk_yaml_hash(
             .map(|s| s.trim())
             .unwrap_or("");
 
-        // Check if hash has actually changed
         if current_hash_in_file == new_hash {
-            // Hash unchanged, no need to update
             return Ok(Some(false));
         }
 
@@ -559,35 +640,25 @@ pub(crate) fn update_sdk_yaml_hash(
                 new_hash
             ));
         } else {
-            // Update the sha256 value while preserving formatting
             let mut updated_lines: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
             let current_line = &updated_lines[line_idx];
-
-            // Extract indentation from the line
             let indent: String = current_line
                 .chars()
                 .take_while(|c| c.is_whitespace())
                 .collect();
-
             updated_lines[line_idx] = format!("{}sha256: {}", indent, new_hash);
-
             content = updated_lines.join("\n");
             fs::write(config_path, &content)?;
-            messages::status(&format!(
-                "Updated sha256 for {}: {}",
-                dest_or_source, new_hash
-            ));
+            messages::status(&format!("Updated sha256 for {}: {}", entry_name, new_hash));
         }
 
         return Ok(Some(true));
     }
 
-    // File doesn't have an existing sha256 field
+    // No sha256 field exists
     if add_missing {
-        // Insert a new sha256 field at the end of the entry block
         let entry_start = entry_start_idx.unwrap_or(0);
 
-        // Determine field indentation from the line immediately after the entry marker
         let field_indent = if entry_start + 1 < lines.len() {
             lines[entry_start + 1]
                 .chars()
@@ -597,8 +668,6 @@ pub(crate) fn update_sdk_yaml_hash(
             "    ".to_string()
         };
 
-        // Find the last line that belongs to this entry by scanning forward
-        // while lines remain at least as indented as the field level
         let field_indent_len = field_indent.len();
         let mut last_entry_line = entry_start;
         for (scan_idx, scan_line) in lines.iter().enumerate().skip(entry_start + 1) {
@@ -616,7 +685,7 @@ pub(crate) fn update_sdk_yaml_hash(
         if dry_run {
             messages::status(&format!(
                 "Would add sha256 for {}: {}",
-                dest_or_source, new_hash
+                entry_name, new_hash
             ));
         } else {
             let mut updated_lines: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
@@ -626,21 +695,89 @@ pub(crate) fn update_sdk_yaml_hash(
             );
             content = updated_lines.join("\n");
             fs::write(config_path, &content)?;
-            messages::status(&format!(
-                "Added sha256 for {}: {}",
-                dest_or_source, new_hash
-            ));
+            messages::status(&format!("Added sha256 for {}: {}", entry_name, new_hash));
         }
 
         return Ok(Some(true));
     }
 
-    // No sha256 field and --add-missing not requested - skip this entry
     messages::info(&format!(
         "Skipping {}: no sha256 field in entry",
-        dest_or_source
+        entry_name
     ));
-    Ok(None) // Return Ok(None) to indicate skipped
+    Ok(None)
+}
+
+pub(crate) fn update_sdk_yaml_hash(
+    config_path: &Path,
+    dest_or_source: &str,
+    new_hash: &str,
+    dry_run: bool,
+    add_missing: bool,
+) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    update_yaml_entry_hash(
+        config_path,
+        dest_or_source,
+        "copy_files",
+        new_hash,
+        dry_run,
+        add_missing,
+        |lines, idx| {
+            let trimmed = lines[idx].trim();
+            if trimmed.starts_with("- source:")
+                || trimmed.starts_with("- url:")
+                || trimmed == "source:"
+                || trimmed == "url:"
+            {
+                // Check next few lines for matching dest or source,
+                // stopping at the next entry boundary to avoid matching a sibling entry.
+                for line in lines
+                    .iter()
+                    .take(std::cmp::min(idx + 5, lines.len()))
+                    .skip(idx + 1)
+                {
+                    let tl = line.trim();
+                    if tl.starts_with("- source:") || tl.starts_with("- url:") {
+                        break;
+                    }
+                    if line.contains(&format!("dest: {}", dest_or_source))
+                        || (line.contains("source:") && line.contains(dest_or_source))
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        },
+    )
+}
+
+fn update_sdk_yaml_toolchain_hash(
+    config_path: &Path,
+    toolchain_name: &str,
+    new_hash: &str,
+    dry_run: bool,
+    add_missing: bool,
+) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    update_yaml_entry_hash(
+        config_path,
+        toolchain_name,
+        "toolchain",
+        new_hash,
+        dry_run,
+        add_missing,
+        |lines, idx| {
+            let trimmed = lines[idx].trim();
+            if trimmed.starts_with("- name:") {
+                let entry_name = trimmed
+                    .strip_prefix("- name:")
+                    .map(|s| s.trim())
+                    .unwrap_or("");
+                return entry_name == toolchain_name;
+            }
+            false
+        },
+    )
 }
 
 /// Handle the copy-files-hash command
@@ -654,26 +791,15 @@ pub(crate) fn handle_copy_files_hash_command(
     messages::set_verbose(verbose);
 
     // Must be run from within a workspace
-    let workspace_path = match get_current_workspace() {
-        Ok(path) => path,
+    let (workspace_path, config_path) = match require_workspace_config() {
+        Ok(paths) => paths,
         Err(e) => {
-            messages::error(&format!("Error: {}", e));
+            messages::error(&e);
             return;
         }
     };
 
-    // Use sdk.yml from workspace root (ignore user overrides for hash computation)
-    let config_path = workspace_path.join("sdk.yml");
-    if !config_path.exists() {
-        messages::error(&format!(
-            "sdk.yml not found in workspace root: {}",
-            workspace_path.display()
-        ));
-        return;
-    }
-
-    // Load SDK config (without user overrides)
-    let mut sdk_config = match config::load_config(&config_path) {
+    let mut sdk_config = match load_config_with_user_overrides(&config_path, verbose) {
         Ok(config) => config,
         Err(e) => {
             messages::error(&format!("Error loading config: {}", e));
@@ -681,16 +807,8 @@ pub(crate) fn handle_copy_files_hash_command(
         }
     };
 
-    // Expand manifest ${{ VAR }} variables in copy_files source and dest
-    if let Some(raw_vars) = sdk_config.variables.clone() {
-        let vars = resolve_variables(&raw_vars);
-        if let Some(ref mut copy_files) = sdk_config.copy_files {
-            for cf in copy_files.iter_mut() {
-                cf.source = expand_manifest_vars(&cf.source.clone(), &vars);
-                cf.dest = expand_manifest_vars(&cf.dest.clone(), &vars);
-            }
-        }
-    }
+    // Expand manifest ${{ VAR }} variables
+    expand_manifest_vars_in_config(&mut sdk_config);
 
     // Get copy_files configuration (direct field access)
     let Some(copy_files) = &sdk_config.copy_files else {
@@ -703,8 +821,28 @@ pub(crate) fn handle_copy_files_hash_command(
         return;
     }
 
-    // Expand mirror path (always use base config, not user overrides)
-    let mirror_path = expand_config_mirror_path(&sdk_config);
+    // If this workspace extends: a base, only copy_files entries owned by
+    // this target (added directly in its own sdk.yml, or modified via its
+    // own overlay: key) can be updated here -- the base target's own entries
+    // are managed independently in the base's own manifest.
+    let extends_scope = match load_extends_owned_entries(&config_path) {
+        Ok(scope) => scope,
+        Err(e) => {
+            messages::error(&e);
+            return;
+        }
+    };
+    if let Some((base_target, _, owned)) = &extends_scope {
+        messages::status(&format!(
+            "This target extends '{}': only the {} copy_files entry(ies) owned by \
+             this target can be updated here.",
+            base_target,
+            owned.copy_files.len()
+        ));
+    }
+
+    // Resolve mirror from user config / built-in default.
+    let mirror_path = resolve_mirror(None);
 
     // Determine the base directory for resolving relative source paths in copy_files.
     // If config_source_dir is a remote URL, re-clone the repo to a fresh temp directory.
@@ -722,6 +860,20 @@ pub(crate) fn handle_copy_files_hash_command(
     let mut skipped_count = 0;
 
     for copy_file in copy_files {
+        // Skip entries inherited from the base target: they aren't owned
+        // by this target, so there's nowhere here to write an updated hash
+        // back to.
+        if let Some((_, _, owned)) = &extends_scope {
+            if !owned.copy_files.contains(&copy_file.dest) {
+                messages::info(&format!(
+                    "Skipping {} (inherited from base target, not owned by this overlay)",
+                    copy_file.dest
+                ));
+                continue;
+            }
+        }
+        let write_target_path = config_path.clone();
+
         // Check if this file matches the filter (if provided)
         if let Some(filter) = file_filter {
             let matches_dest = copy_file.dest.contains(filter);
@@ -744,6 +896,19 @@ pub(crate) fn handle_copy_files_hash_command(
             messages::verbose("No existing hash found");
             String::new()
         });
+
+        // Glob/wildcard sources cannot be hashed — skip with an informational message.
+        if copy_file.source.contains('*')
+            || copy_file.source.contains('?')
+            || copy_file.source.contains('[')
+        {
+            messages::info(&format!(
+                "Skipping wildcard source '{}': glob patterns cannot be hashed",
+                copy_file.source
+            ));
+            skipped_count += 1;
+            continue;
+        }
 
         // Ensure file is available (download if needed)
         let file_path = match ensure_file_in_mirror(copy_file, &config_source_dir, &mirror_path) {
@@ -797,9 +962,9 @@ pub(crate) fn handle_copy_files_hash_command(
                 updated_count += 1;
             }
         } else {
-            // Update sdk.yml with new hash
+            // Update sdk.yml with the new hash
             match update_sdk_yaml_hash(
-                &config_path,
+                &write_target_path,
                 &copy_file.dest,
                 &computed_hash,
                 dry_run,
@@ -855,146 +1020,6 @@ pub(crate) fn handle_copy_files_hash_command(
 /// Update sdk.yml with computed SHA256 hash for a specific toolchain entry
 ///
 /// Matches entries under the `toolchains:` section by the `name:` field.
-fn update_sdk_yaml_toolchain_hash(
-    config_path: &Path,
-    toolchain_name: &str,
-    new_hash: &str,
-    dry_run: bool,
-    add_missing: bool,
-) -> Result<Option<bool>, Box<dyn std::error::Error>> {
-    let mut content = fs::read_to_string(config_path)?;
-
-    let lines: Vec<&str> = content.lines().collect();
-    let mut found_entry = false;
-    let mut updated_line_idx = None;
-    let mut entry_start_idx: Option<usize> = None;
-
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        // Match toolchain entries by "- name:"
-        if !found_entry && trimmed.starts_with("- name:") {
-            let entry_name = trimmed
-                .strip_prefix("- name:")
-                .map(|s| s.trim())
-                .unwrap_or("");
-
-            if entry_name == toolchain_name {
-                found_entry = true;
-                entry_start_idx = Some(idx);
-
-                // Find sha256 line within this entry
-                for (k, sha_line) in lines
-                    .iter()
-                    .enumerate()
-                    .take(std::cmp::min(idx + 15, lines.len()))
-                    .skip(idx)
-                {
-                    if sha_line.trim().starts_with("sha256:") {
-                        updated_line_idx = Some(k);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if !found_entry {
-        return Err(format!("Could not find toolchain entry for: {}", toolchain_name).into());
-    }
-
-    let display_name = toolchain_name;
-
-    if let Some(line_idx) = updated_line_idx {
-        let current_line = lines[line_idx];
-        let current_hash_in_file = current_line
-            .trim()
-            .strip_prefix("sha256:")
-            .map(|s| s.trim())
-            .unwrap_or("");
-
-        if current_hash_in_file == new_hash {
-            return Ok(Some(false));
-        }
-
-        if dry_run {
-            messages::status(&format!(
-                "Would update line {} from '{}' to 'sha256: {}'",
-                line_idx + 1,
-                lines[line_idx],
-                new_hash
-            ));
-        } else {
-            let mut updated_lines: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
-            let current_line = &updated_lines[line_idx];
-            let indent: String = current_line
-                .chars()
-                .take_while(|c| c.is_whitespace())
-                .collect();
-            updated_lines[line_idx] = format!("{}sha256: {}", indent, new_hash);
-            content = updated_lines.join("\n");
-            fs::write(config_path, &content)?;
-            messages::status(&format!(
-                "Updated sha256 for {}: {}",
-                display_name, new_hash
-            ));
-        }
-
-        return Ok(Some(true));
-    }
-
-    // No sha256 field exists
-    if add_missing {
-        let entry_start = entry_start_idx.unwrap_or(0);
-
-        let field_indent = if entry_start + 1 < lines.len() {
-            lines[entry_start + 1]
-                .chars()
-                .take_while(|c| c.is_whitespace())
-                .collect::<String>()
-        } else {
-            "    ".to_string()
-        };
-
-        let field_indent_len = field_indent.len();
-        let mut last_entry_line = entry_start;
-        for (scan_idx, scan_line) in lines.iter().enumerate().skip(entry_start + 1) {
-            if scan_line.trim().is_empty() {
-                break;
-            }
-            let scan_indent_len = scan_line.chars().take_while(|c| c.is_whitespace()).count();
-            if scan_indent_len >= field_indent_len {
-                last_entry_line = scan_idx;
-            } else {
-                break;
-            }
-        }
-
-        if dry_run {
-            messages::status(&format!(
-                "Would add sha256 for {}: {}",
-                display_name, new_hash
-            ));
-        } else {
-            let mut updated_lines: Vec<String> = lines.iter().map(|s| (*s).to_string()).collect();
-            updated_lines.insert(
-                last_entry_line + 1,
-                format!("{field_indent}sha256: {new_hash}"),
-            );
-            content = updated_lines.join("\n");
-            fs::write(config_path, &content)?;
-            messages::status(&format!("Added sha256 for {}: {}", display_name, new_hash));
-        }
-
-        return Ok(Some(true));
-    }
-
-    messages::info(&format!(
-        "Skipping {}: no sha256 field in entry",
-        display_name
-    ));
-    Ok(None)
-}
-
 /// Handle the hash-toolchains command
 pub(crate) fn handle_toolchains_hash_command(
     file_filter: Option<&str>,
@@ -1004,24 +1029,15 @@ pub(crate) fn handle_toolchains_hash_command(
 ) {
     messages::set_verbose(verbose);
 
-    let workspace_path = match get_current_workspace() {
-        Ok(path) => path,
+    let (_workspace_path, config_path) = match require_workspace_config() {
+        Ok(paths) => paths,
         Err(e) => {
-            messages::error(&format!("Error: {}", e));
+            messages::error(&e);
             return;
         }
     };
 
-    let config_path = workspace_path.join("sdk.yml");
-    if !config_path.exists() {
-        messages::error(&format!(
-            "sdk.yml not found in workspace root: {}",
-            workspace_path.display()
-        ));
-        return;
-    }
-
-    let sdk_config = match config::load_config(&config_path) {
+    let sdk_config = match load_config_with_user_overrides(&config_path, verbose) {
         Ok(config) => config,
         Err(e) => {
             messages::error(&format!("Error loading config: {}", e));
@@ -1039,7 +1055,27 @@ pub(crate) fn handle_toolchains_hash_command(
         return;
     }
 
-    let mirror_path = expand_config_mirror_path(&sdk_config);
+    // If this workspace extends: a base, only toolchain entries owned by
+    // this target (added directly in its own sdk.yml, or modified via its
+    // own overlay: key) can be updated here -- the base target's own entries
+    // are managed independently in the base's own manifest.
+    let extends_scope = match load_extends_owned_entries(&config_path) {
+        Ok(scope) => scope,
+        Err(e) => {
+            messages::error(&e);
+            return;
+        }
+    };
+    if let Some((base_target, _, owned)) = &extends_scope {
+        messages::status(&format!(
+            "This target extends '{}': only the {} toolchain(s) owned by this \
+             target can be updated here.",
+            base_target,
+            owned.toolchains.len()
+        ));
+    }
+
+    let mirror_path = resolve_mirror(None);
 
     // Filter toolchains to only those applicable to this host
     let host_info = dsdk_cli::toolchain_manager::detect_host_info();
@@ -1064,6 +1100,20 @@ pub(crate) fn handle_toolchains_hash_command(
 
     for toolchain in &applicable {
         let name = toolchain.get_name();
+
+        // Skip entries inherited from the base target: they aren't owned
+        // by this target, so there's nowhere here to write an updated hash
+        // back to.
+        if let Some((_, _, owned)) = &extends_scope {
+            if !owned.toolchains.contains(&name) {
+                messages::info(&format!(
+                    "Skipping {} (inherited from base target, not owned by this overlay)",
+                    name
+                ));
+                continue;
+            }
+        }
+        let write_target_path = config_path.clone();
 
         // Apply filter if provided
         if let Some(filter) = file_filter {
@@ -1129,7 +1179,7 @@ pub(crate) fn handle_toolchains_hash_command(
         } else {
             let tc_name = &name;
             match update_sdk_yaml_toolchain_hash(
-                &config_path,
+                &write_target_path,
                 tc_name,
                 &computed_hash,
                 dry_run,
@@ -1189,27 +1239,15 @@ pub(crate) fn handle_sync_files_hash_command(
     // Set verbose mode for this command
     messages::set_verbose(verbose);
 
-    // Must be run from within a workspace
-    let workspace_path = match get_current_workspace() {
-        Ok(path) => path,
+    let (workspace_path, config_path) = match require_workspace_config() {
+        Ok(paths) => paths,
         Err(e) => {
-            messages::error(&format!("Error: {}", e));
+            messages::error(&e);
             return;
         }
     };
 
-    // Use sdk.yml from workspace root
-    let config_path = workspace_path.join("sdk.yml");
-    if !config_path.exists() {
-        messages::error(&format!(
-            "sdk.yml not found in workspace root: {}",
-            workspace_path.display()
-        ));
-        return;
-    }
-
-    // Load SDK config (without user overrides for sync operation)
-    let mut sdk_config = match config::load_config(&config_path) {
+    let mut sdk_config = match load_config_with_user_overrides(&config_path, verbose) {
         Ok(config) => config,
         Err(e) => {
             messages::error(&format!("Error loading config: {}", e));
@@ -1218,15 +1256,8 @@ pub(crate) fn handle_sync_files_hash_command(
     };
 
     // Expand manifest ${{ VAR }} variables in copy_files source and dest
-    if let Some(raw_vars) = sdk_config.variables.clone() {
-        let vars = resolve_variables(&raw_vars);
-        if let Some(ref mut copy_files) = sdk_config.copy_files {
-            for cf in copy_files.iter_mut() {
-                cf.source = expand_manifest_vars(&cf.source.clone(), &vars);
-                cf.dest = expand_manifest_vars(&cf.dest.clone(), &vars);
-            }
-        }
-    }
+    // Expand manifest ${{ VAR }} variables
+    expand_manifest_vars_in_config(&mut sdk_config);
 
     // Get copy_files configuration
     let Some(copy_files) = &sdk_config.copy_files else {
@@ -1240,7 +1271,7 @@ pub(crate) fn handle_sync_files_hash_command(
     }
 
     // Expand mirror path
-    let mirror_path = expand_config_mirror_path(&sdk_config);
+    let mirror_path = resolve_mirror(None);
 
     // Determine the base directory for resolving relative source paths in copy_files.
     // If config_source_dir is a remote URL, re-clone the repo to a fresh temp directory.
@@ -1463,7 +1494,7 @@ gits:
     build:
       - "@echo Building test-repo"
 "#;
-        let config_path = temp_dir.join("sdk.yml");
+        let config_path = temp_dir.join(SDK_CONFIG_FILE);
         fs::write(&config_path, config_content).expect("Failed to write test config");
         config_path
     }
@@ -1517,7 +1548,7 @@ gits:
     url: https://github.com/test/another.git
     commit: develop
 "#;
-        let config_path = workspace_path.join("sdk.yml");
+        let config_path = workspace_path.join(SDK_CONFIG_FILE);
         fs::write(&config_path, config_content).expect("Failed to write test config");
 
         let tag = "v2.0.0";
@@ -1617,7 +1648,7 @@ gits:
     url: https://github.com/test/simple.git
     commit: feature-xyz
 "#;
-        let config_path = workspace_path.join("sdk.yml");
+        let config_path = workspace_path.join(SDK_CONFIG_FILE);
         fs::write(&config_path, config_content).expect("Failed to write test config");
 
         let tag = "v3.0.0";
@@ -1688,7 +1719,7 @@ gits:
 mirror: /tmp/test-mirror
 gits:
 "#;
-        let config_path = workspace_path.join("sdk.yml");
+        let config_path = workspace_path.join(SDK_CONFIG_FILE);
         fs::write(&config_path, minimal_config).expect("Failed to write minimal config");
 
         let result = generate_release_config(&config_path, Some("v1.0.0"), &None, &[], &[]);
@@ -1715,7 +1746,7 @@ gits:
     depends_on:
       - repo1
 "#;
-        let config_path = workspace_path.join("sdk.yml");
+        let config_path = workspace_path.join(SDK_CONFIG_FILE);
         fs::write(&config_path, config_content).expect("Failed to write indented config");
 
         let result = generate_release_config(&config_path, Some("v1.0.0"), &None, &[], &[]);
@@ -1898,7 +1929,7 @@ copy_files:\n\
   - source: /home/user/.bashrc\n\
     dest: .bashrc\n";
 
-        let config_path = temp_dir.path().join("sdk.yml");
+        let config_path = temp_dir.path().join(SDK_CONFIG_FILE);
         fs::write(&config_path, yaml).expect("Failed to write sdk.yml");
 
         let fake_hash = "abc123def456";
@@ -1949,7 +1980,7 @@ copy_files:\n\
   - source: /home/user/.bashrc\n\
     dest: .bashrc\n";
 
-        let config_path = temp_dir.path().join("sdk.yml");
+        let config_path = temp_dir.path().join(SDK_CONFIG_FILE);
         fs::write(&config_path, yaml).expect("Failed to write sdk.yml");
 
         let result = update_sdk_yaml_hash(&config_path, ".bashrc", "deadbeef", true, true).unwrap();
@@ -1965,5 +1996,107 @@ copy_files:\n\
             !content.contains("sha256:"),
             "sha256 must not be inserted in dry_run mode"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // generate_release_config tests with an embedded overlay: section
+    // (extends:-scoped release)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_generate_release_config_freezes_nested_overlay_gits_too() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+
+        // A single sdk.yml with both a top-level gits: list (this target's
+        // own new entries) and a nested overlay: gits: modify: list (this
+        // target's diff against the inherited base gits). One freeze pass
+        // must update both sections in the same output file.
+        let config_content = r#"
+extends: platform-sdk
+gits:
+  - name: drone-camera
+    url: https://example.com/camera.git
+    commit: main
+overlay:
+  gits:
+    remove:
+      - mcuboot
+    modify:
+      - name: zephyr
+        commit: v4.4.0
+"#;
+        let config_path = workspace_path.join(SDK_CONFIG_FILE);
+        fs::write(&config_path, config_content).expect("Failed to write sdk.yml");
+
+        let tagged_repos = vec!["drone-camera".to_string(), "zephyr".to_string()];
+        let skipped_repos = vec![];
+
+        let result = generate_release_config(
+            &config_path,
+            Some("v1.0.0"),
+            &None,
+            &skipped_repos,
+            &tagged_repos,
+        );
+        assert!(result.is_ok());
+
+        let output_path = workspace_path.join("sdk_v1_0_0.yml");
+        assert!(output_path.exists());
+        let content = fs::read_to_string(&output_path).expect("Failed to read output");
+
+        // Both the top-level entry (drone-camera) and the nested overlay:
+        // gits: modify: entry (zephyr) got the tag frozen in.
+        assert_eq!(content.matches("commit: v1.0.0").count(), 2);
+        assert!(!content.contains("commit: main"));
+        assert!(!content.contains("commit: v4.4.0"));
+        // remove: list is untouched (still a plain string, no commit: line to freeze).
+        assert!(content.contains("mcuboot"));
+    }
+
+    // -----------------------------------------------------------------
+    // load_extends_owned_entries tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_load_extends_owned_entries_non_extends_returns_none() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+        let config_path = create_test_sdk_config(&workspace_path);
+
+        let result = load_extends_owned_entries(&config_path).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_load_extends_owned_entries_extends_with_overlay() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+        let config_path = workspace_path.join(SDK_CONFIG_FILE);
+        fs::write(
+            &config_path,
+            "extends: base-sdk\ngits:\n  - name: drone-camera\n    url: https://example.com/camera.git\n    commit: main\noverlay:\n  gits:\n    modify:\n      - name: zephyr\n        commit: v4.5.0\n",
+        )
+        .expect("Failed to write sdk.yml");
+
+        let (base_target, _raw_primary, owned) = load_extends_owned_entries(&config_path)
+            .unwrap()
+            .expect("should detect extends");
+        assert_eq!(base_target, "base-sdk");
+        // Owned via sdk.yml's own new gits: entry.
+        assert!(owned.gits.contains("drone-camera"));
+        // Owned via sdk.yml's overlay: key's modify:.
+        assert!(owned.gits.contains("zephyr"));
+    }
+
+    #[test]
+    fn test_load_extends_owned_entries_extends_without_overlay_key() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+        let config_path = workspace_path.join(SDK_CONFIG_FILE);
+        fs::write(&config_path, "gits: []\nextends: base-sdk\n").expect("Failed to write sdk.yml");
+        // No overlay: key present -- should still succeed, with empty owned entries.
+
+        let (base_target, _raw_primary, owned) = load_extends_owned_entries(&config_path)
+            .unwrap()
+            .expect("should detect extends");
+        assert_eq!(base_target, "base-sdk");
+        assert!(owned.gits.is_empty());
     }
 }

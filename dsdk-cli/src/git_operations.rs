@@ -67,8 +67,50 @@ pub fn git_command(args: &[&str], cwd: Option<&Path>) -> Result<GitResult> {
     })
 }
 
+// ---------------------------------------------------------------
+// Utility helpers
+// ---------------------------------------------------------------
+
+/// Convert a local filesystem path to a `file://` URL suitable for git.
+///
+/// On Unix the path starts with `/`, so `"file://" + path` gives the correct
+/// three-slash form (`file:///path`).  On Windows `Path::display()` produces
+/// `C:\...` which yields the invalid `file://C:\...`.  The correct form is
+/// `file:///C:/...` with forward slashes.  The Windows extended-length prefix
+/// `\\?\` produced by `std::fs::canonicalize` is also stripped beforehand.
+pub fn path_to_file_url(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        let clean = s.strip_prefix(r"\\?\").unwrap_or(&s);
+        let forward = clean.replace('\\', "/");
+        format!("file:///{}", forward)
+    }
+    #[cfg(not(windows))]
+    format!("file://{}", path.display())
+}
+
+/// Strip the Windows extended-length path prefix `\\?\`.
+///
+/// `std::fs::canonicalize` on Windows returns `\\?\`-prefixed paths.
+/// Most tools do not accept this prefix, so we strip it back to a plain
+/// absolute path before passing it to git operations.
+pub fn strip_unc_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(stripped.to_string());
+        }
+    }
+    path
+}
+
+// ---------------------------------------------------------------
+// Clone operations
+// ---------------------------------------------------------------
+
 /// Clone repository to specified path
-/// On Windows, if SSH fails, automatically retries with HTTPS by temporarily disabling insteadOf config
 pub fn clone_repo(url: &str, path: &Path, reference: Option<&Path>) -> Result<GitResult> {
     let mut args = vec!["clone".to_string()];
 
@@ -81,95 +123,21 @@ pub fn clone_repo(url: &str, path: &Path, reference: Option<&Path>) -> Result<Gi
     args.push(path.to_string_lossy().to_string());
 
     let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let result = git_command(&args_str, None)?;
+    git_command(&args_str, None)
+}
 
-    // On Windows, if clone fails with SSH error, retry with HTTPS by disabling insteadOf
-    #[cfg(target_os = "windows")]
-    {
-        if !result.is_success()
-            && (result.stderr.contains("kex_exchange_identification")
-                || result.stderr.contains("Connection to") && result.stderr.contains("port 22")
-                || result
-                    .stderr
-                    .contains("Could not read from remote repository"))
-        {
-            crate::messages::info("SSH connection failed, retrying with HTTPS...");
-
-            // Try again with git config to disable insteadOf rewriting
-            let mut cmd = Command::new("git");
-            cmd.args(&args_str);
-
-            // Disable interactive authentication prompts
-            cmd.env("GIT_TERMINAL_PROMPT", "0");
-            cmd.env("GIT_ASKPASS", "echo");
-
-            // Override insteadOf configuration to prevent SSH URL rewriting
-            cmd.env("GIT_CONFIG_COUNT", "1");
-            cmd.env("GIT_CONFIG_KEY_0", "url.https://github.com/.insteadOf");
-            cmd.env("GIT_CONFIG_VALUE_0", "");
-
-            let output = cmd
-                .output()
-                .map_err(|e| anyhow!("Failed to execute git {}: {}", args_str.join(" "), e))?;
-
-            return Ok(GitResult {
-                success: output.status.success(),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            });
-        }
-    }
-
-    Ok(result)
+/// Convert a shallow repository to a full clone
+pub fn fetch_unshallow(repo_path: &Path) -> Result<GitResult> {
+    git_command(&["fetch", "--unshallow"], Some(repo_path))
 }
 
 /// Clone repository with shallow depth
-/// On Windows, if SSH fails, automatically retries with HTTPS by temporarily disabling insteadOf config
 pub fn clone_repo_shallow(url: &str, path: &Path, depth: u32) -> Result<GitResult> {
     let depth_str = depth.to_string();
     let path_str = path.to_string_lossy().to_string();
     let args = vec!["clone", "--depth", &depth_str, url, &path_str];
 
-    let result = git_command(&args, None)?;
-
-    // On Windows, if clone fails with SSH error, retry with HTTPS by disabling insteadOf
-    #[cfg(target_os = "windows")]
-    {
-        if !result.is_success()
-            && (result.stderr.contains("kex_exchange_identification")
-                || result.stderr.contains("Connection to") && result.stderr.contains("port 22")
-                || result
-                    .stderr
-                    .contains("Could not read from remote repository"))
-        {
-            crate::messages::info("SSH connection failed, retrying with HTTPS...");
-
-            // Try again with git config to disable insteadOf rewriting
-            let mut cmd = Command::new("git");
-            cmd.args(&args);
-
-            // Disable interactive authentication prompts
-            cmd.env("GIT_TERMINAL_PROMPT", "0");
-            cmd.env("GIT_ASKPASS", "echo");
-
-            // Override insteadOf configuration to prevent SSH URL rewriting
-            cmd.env("GIT_CONFIG_COUNT", "1");
-            cmd.env("GIT_CONFIG_KEY_0", "url.https://github.com/.insteadOf");
-            cmd.env("GIT_CONFIG_VALUE_0", "");
-
-            let output = cmd
-                .output()
-                .map_err(|e| anyhow!("Failed to execute git {}: {}", args.join(" "), e))?;
-
-            return Ok(GitResult {
-                success: output.status.success(),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            });
-        }
-    }
-
-    Ok(result)
+    git_command(&args, None)
 }
 
 /// Clone repository with single branch
@@ -208,6 +176,10 @@ pub fn clone_repo_shallow_single_branch(
     git_command(&args, None)
 }
 
+// ---------------------------------------------------------------
+// Fetch operations
+// ---------------------------------------------------------------
+
 /// Fetch from remote
 pub fn fetch(repo_path: &Path, remote: Option<&str>) -> Result<GitResult> {
     let remote = remote.unwrap_or("origin");
@@ -217,6 +189,25 @@ pub fn fetch(repo_path: &Path, remote: Option<&str>) -> Result<GitResult> {
 /// Fetch all remotes
 pub fn fetch_all(repo_path: &Path) -> Result<GitResult> {
     git_command(&["fetch", "--all"], Some(repo_path))
+}
+
+/// Fetch a specific refspec, optionally with a depth limit
+pub fn fetch_ref(
+    repo_path: &Path,
+    remote: &str,
+    refspec: &str,
+    depth: Option<u32>,
+) -> Result<GitResult> {
+    match depth {
+        Some(d) => {
+            let depth_str = d.to_string();
+            git_command(
+                &["fetch", remote, refspec, "--depth", &depth_str],
+                Some(repo_path),
+            )
+        }
+        None => git_command(&["fetch", remote, refspec], Some(repo_path)),
+    }
 }
 
 /// Fetch all remotes with tags
@@ -253,13 +244,18 @@ pub fn fetch_tags(repo_path: &Path, remote: Option<&str>) -> Result<GitResult> {
     git_command(&["fetch", remote, "--tags"], Some(repo_path))
 }
 
+// ---------------------------------------------------------------
+// Checkout / branch operations
+// ---------------------------------------------------------------
+
 /// Checkout commit/branch/tag
 pub fn checkout(repo_path: &Path, commit_ref: &str) -> Result<GitResult> {
     git_command(&["checkout", commit_ref], Some(repo_path))
 }
 
 /// List remote references
-pub fn ls_remote(url: &str, heads: bool, tags: bool) -> Result<Vec<String>> {
+/// Returns `(sha, ref_name)`
+pub fn ls_remote(url: &str, heads: bool, tags: bool) -> Result<Vec<(String, String)>> {
     let mut args = vec!["ls-remote"];
     if heads {
         args.push("--heads");
@@ -274,13 +270,23 @@ pub fn ls_remote(url: &str, heads: bool, tags: bool) -> Result<Vec<String>> {
         return Err(anyhow!("git ls-remote failed: {}", result.stderr));
     }
 
-    let refs: Vec<String> = result
+    let refs = result
         .stdout
         .lines()
-        .filter_map(|line| line.split_whitespace().nth(1).map(|s| s.to_string()))
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let sha = cols.next()?.to_string();
+            let refname = cols.next()?.to_string();
+            Some((sha, refname))
+        })
         .collect();
 
     Ok(refs)
+}
+
+/// Check if a git object exists in a repository
+pub fn cat_file(repo_path: &Path, object: &str) -> bool {
+    git_command(&["cat-file", "-e", object], Some(repo_path)).is_ok_and(|r| r.success)
 }
 
 /// List all tags from a local git repository
@@ -342,7 +348,29 @@ pub fn is_branch_reference(repo_path: &Path, commit_ref: &str) -> bool {
 
 /// Get latest commit hash for branch
 pub fn get_latest_commit_for_branch(repo_path: &Path, branch_name: &str) -> Option<String> {
-    // Try remote branch first
+    get_latest_commit_for_branch_with_remote(repo_path, branch_name, None)
+}
+
+/// Get latest commit hash for branch, checking `preferred_remote` first.
+/// Pass `Some("mirror")` when the workspace fetched from a local mirror so that
+/// the freshly-updated `mirror/<branch>` tracking ref is used instead of the
+/// stale `origin/<branch>` ref (which is never fetched in the mirror path).
+pub fn get_latest_commit_for_branch_with_remote(
+    repo_path: &Path,
+    branch_name: &str,
+    preferred_remote: Option<&str>,
+) -> Option<String> {
+    // Try preferred remote first (e.g. "mirror/platform-sdk")
+    if let Some(remote) = preferred_remote {
+        let remote_branch = format!("{}/{}", remote, branch_name);
+        if let Ok(result) = git_command(&["rev-parse", &remote_branch], Some(repo_path)) {
+            if result.success {
+                return Some(result.stdout.trim().to_string());
+            }
+        }
+    }
+
+    // Try origin/
     let remote_branch = format!("origin/{}", branch_name);
     if let Ok(result) = git_command(&["rev-parse", &remote_branch], Some(repo_path)) {
         if result.success {
@@ -393,6 +421,53 @@ pub fn get_latest_commit_for_remote_branch(
     None
 }
 
+// ---------------------------------------------------------------
+// Refspec resolution
+// ---------------------------------------------------------------
+
+/// Determine the fetch refspec, update-ref target, and resolved SHA from ls-remote pairs.
+///
+/// Returns `(fetch_refspec, update_ref_name, sha)`, in order of precedence:
+/// - Tag `v1.0`    : `(refs/tags/v1.0, refs/tags/v1.0, Some(sha))`
+/// - Branch `foo`  : `(refs/heads/foo, refs/heads/foo, Some(sha))`
+/// - Commit SHA    : `(sha, refs/heads/trunk, None)`
+pub fn resolve_fetch_refspec(
+    refs: &[(String, String)],
+    ref_name: &str,
+) -> (String, String, Option<String>) {
+    // Explicit reference
+    if ref_name.starts_with("refs/heads/") || ref_name.starts_with("refs/tags/") {
+        let sha = refs
+            .iter()
+            .find(|(_, r)| r == ref_name)
+            .map(|(s, _)| s.clone());
+        return (ref_name.to_string(), ref_name.to_string(), sha);
+    }
+    // Iterate in reverse so tags take precedence over a same-named branch.
+    for (sha, full_ref) in refs.iter().rev() {
+        if full_ref == &format!("refs/tags/{}", ref_name) {
+            return (
+                format!("refs/tags/{}", ref_name),
+                format!("refs/tags/{}", ref_name),
+                Some(sha.clone()),
+            );
+        }
+        if full_ref == &format!("refs/heads/{}", ref_name) {
+            return (
+                format!("refs/heads/{}", ref_name),
+                format!("refs/heads/{}", ref_name),
+                Some(sha.clone()),
+            );
+        }
+    }
+    // Commit hash — fetch directly, anchor under trunk
+    (ref_name.to_string(), "refs/heads/trunk".to_string(), None)
+}
+
+// ---------------------------------------------------------------
+// Repository state
+// ---------------------------------------------------------------
+
 /// Get current commit hash
 pub fn get_current_commit(repo_path: &Path) -> Result<String> {
     let result = git_command(&["rev-parse", "HEAD"], Some(repo_path))?;
@@ -413,6 +488,10 @@ pub fn is_repo_dirty(repo_path: &Path) -> Result<bool> {
     }
     Ok(!result.stdout.trim().is_empty())
 }
+
+// ---------------------------------------------------------------
+// Ref / branch management
+// ---------------------------------------------------------------
 
 /// Update reference (for mirrors)
 pub fn update_ref(repo_path: &Path, ref_name: &str, commit_hash: &str) -> Result<GitResult> {
@@ -441,6 +520,10 @@ pub fn create_branch_force(
     git_command(&["branch", "-f", branch_name, commit_ref], Some(repo_path))
 }
 
+// ---------------------------------------------------------------
+// Clone variants (bare / mirror)
+// ---------------------------------------------------------------
+
 /// Clone repository as bare (for mirrors)
 pub fn clone_bare(url: &str, path: &Path) -> Result<GitResult> {
     let path_str = path.to_string_lossy().to_string();
@@ -461,6 +544,10 @@ pub fn clone_mirror(url: &str, path: &Path) -> Result<GitResult> {
     git_command(&args, None)
 }
 
+// ---------------------------------------------------------------
+// Remote management
+// ---------------------------------------------------------------
+
 /// Get the URL of a remote
 pub fn get_remote_url(repo_path: &Path, remote_name: &str) -> Result<String> {
     let result = git_command(&["remote", "get-url", remote_name], Some(repo_path))?;
@@ -470,6 +557,20 @@ pub fn get_remote_url(repo_path: &Path, remote_name: &str) -> Result<String> {
         Err(anyhow!("Failed to get URL for remote '{}'", remote_name))
     }
 }
+
+/// Set remote URL
+pub fn remote_set_url(repo_path: &Path, remote_name: &str, url: &str) -> Result<GitResult> {
+    git_command(&["remote", "set-url", remote_name, url], Some(repo_path))
+}
+
+/// Add remote
+pub fn remote_add(repo_path: &Path, remote_name: &str, url: &str) -> Result<GitResult> {
+    git_command(&["remote", "add", remote_name, url], Some(repo_path))
+}
+
+// ---------------------------------------------------------------
+// URL utilities
+// ---------------------------------------------------------------
 
 /// Normalize a git URL for comparison purposes.
 /// Strips trailing `/` and `.git`, then lowercases.
@@ -518,15 +619,9 @@ pub fn extract_org_and_repo(url: &str) -> String {
     }
 }
 
-/// Set remote URL
-pub fn remote_set_url(repo_path: &Path, remote_name: &str, url: &str) -> Result<GitResult> {
-    git_command(&["remote", "set-url", remote_name, url], Some(repo_path))
-}
-
-/// Add remote
-pub fn remote_add(repo_path: &Path, remote_name: &str, url: &str) -> Result<GitResult> {
-    git_command(&["remote", "add", remote_name, url], Some(repo_path))
-}
+// ---------------------------------------------------------------
+// Repository initialization and commit operations
+// ---------------------------------------------------------------
 
 /// Initialize git repository
 pub fn init_repo(path: &Path, bare: bool) -> Result<GitResult> {
@@ -612,6 +707,10 @@ pub fn list_tags(repo_path: &Path, pattern: Option<&str>) -> Result<Vec<String>>
 pub fn config(repo_path: &Path, key: &str, value: &str) -> Result<GitResult> {
     git_command(&["config", key, value], Some(repo_path))
 }
+
+// ---------------------------------------------------------------
+// Error formatting
+// ---------------------------------------------------------------
 
 /// Enhanced error message for git failures
 pub fn enhanced_git_error(operation: &str, result: &GitResult, context: Option<&str>) -> String {
@@ -721,12 +820,76 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_fetch_refspec_explicit_refs_heads() {
+        let refs = vec![
+            ("abc123".to_string(), "refs/heads/main".to_string()),
+            ("def456".to_string(), "refs/tags/v1.0.0".to_string()),
+        ];
+
+        // Explicit refs/heads/ — SHA resolved from ls-remote
+        let (fetch, update, sha) = resolve_fetch_refspec(&refs, "refs/heads/main");
+        assert_eq!(fetch, "refs/heads/main");
+        assert_eq!(update, "refs/heads/main");
+        assert_eq!(sha, Some("abc123".to_string()));
+
+        // Explicit refs/heads/ not in ls-remote — SHA is None
+        let (fetch, update, sha) = resolve_fetch_refspec(&refs, "refs/heads/missing");
+        assert_eq!(fetch, "refs/heads/missing");
+        assert_eq!(update, "refs/heads/missing");
+        assert_eq!(sha, None);
+    }
+
+    #[test]
+    fn test_resolve_fetch_refspec_explicit_refs_tags() {
+        let refs = vec![
+            ("abc123".to_string(), "refs/heads/main".to_string()),
+            ("def456".to_string(), "refs/tags/v1.0.0".to_string()),
+        ];
+
+        let (fetch, update, sha) = resolve_fetch_refspec(&refs, "refs/tags/v1.0.0");
+        assert_eq!(fetch, "refs/tags/v1.0.0");
+        assert_eq!(update, "refs/tags/v1.0.0");
+        assert_eq!(sha, Some("def456".to_string()));
+
+        let (fetch, update, sha) = resolve_fetch_refspec(&refs, "refs/tags/missing");
+        assert_eq!(fetch, "refs/tags/missing");
+        assert_eq!(update, "refs/tags/missing");
+        assert_eq!(sha, None);
+    }
+
+    #[test]
+    fn test_resolve_fetch_refspec_short_names() {
+        let refs = vec![
+            ("abc123".to_string(), "refs/heads/main".to_string()),
+            ("def456".to_string(), "refs/tags/v1.0.0".to_string()),
+        ];
+
+        // Short branch name
+        let (fetch, update, sha) = resolve_fetch_refspec(&refs, "main");
+        assert_eq!(fetch, "refs/heads/main");
+        assert_eq!(update, "refs/heads/main");
+        assert_eq!(sha, Some("abc123".to_string()));
+
+        // Short tag name
+        let (fetch, update, sha) = resolve_fetch_refspec(&refs, "v1.0.0");
+        assert_eq!(fetch, "refs/tags/v1.0.0");
+        assert_eq!(update, "refs/tags/v1.0.0");
+        assert_eq!(sha, Some("def456".to_string()));
+
+        // Commit SHA fallthrough
+        let (fetch, update, sha) = resolve_fetch_refspec(&refs, "deadbeef");
+        assert_eq!(fetch, "deadbeef");
+        assert_eq!(update, "refs/heads/trunk");
+        assert_eq!(sha, None);
+    }
+
+    #[test]
     fn test_ls_remote_format() {
         // Test with a known public repository
         if let Ok(refs) = ls_remote("https://github.com/git/git.git", true, false) {
             assert!(!refs.is_empty());
             // Check that we get proper ref format
-            assert!(refs.iter().any(|r| r.starts_with("refs/heads/")));
+            assert!(refs.iter().any(|(_, r)| r.starts_with("refs/heads/")));
         }
     }
 
@@ -752,7 +915,7 @@ mod tests {
         create_tag(&upstream_dir, "v1.0.0").unwrap();
 
         // Create bare clone (mirror)
-        clone_bare(&format!("file://{}", upstream_dir.display()), &mirror_dir).unwrap();
+        clone_bare(&path_to_file_url(&upstream_dir), &mirror_dir).unwrap();
 
         // Verify tag was cloned
         let tags = list_local_tags(&mirror_dir).unwrap();

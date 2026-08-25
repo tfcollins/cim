@@ -11,25 +11,22 @@
 
 use crate::cli::DocsCommand;
 use crate::install_cmd::{
-    ensure_docs_dependencies, install_prerequisites, install_python_packages_from_file,
-    is_container_environment,
+    ensure_docs_dependencies, install_git_python_deps, is_container_environment,
 };
 use crate::makefile::generate_makefile_content;
-use crate::update_cmd::{
-    update_mirror_repos, update_workspace_repos_no_mirror_with_result,
-    update_workspace_repos_with_result,
-};
+use crate::update_cmd::{update_mirror_repos, update_workspace_repos_with_result};
 use crate::version::spawn_version_check;
 use dsdk_cli::config::SdkConfigCore;
 use dsdk_cli::download::{copy_yaml_files_to_workspace, process_copy_files};
 use dsdk_cli::workspace::{
-    create_workspace_marker, download_config_from_url, expand_config_mirror_path, expand_env_vars,
-    expand_manifest_vars, get_current_workspace, get_default_source, is_url,
-    load_config_with_user_overrides, resolve_target_config_from_git, resolve_variables,
-    CreateWorkspaceMarkerParams,
+    create_workspace_marker, download_config_from_url, expand_env_vars,
+    expand_manifest_vars_in_config, get_all_sources_from_config, get_home_dir, is_url,
+    load_config_with_extends, load_config_with_user_overrides, require_workspace_config,
+    resolve_mirror, resolve_target_config_from_git, CreateWorkspaceMarkerParams, OS_DEPS_FILE,
+    OVERLAYS_DIR, PYTHON_DEPS_FILE, SDK_CONFIG_FILE, WORKSPACE_MARKER_FILE,
 };
 use dsdk_cli::{
-    config, doc_manager, git_operations, messages, toolchain_manager, vscode_tasks_manager,
+    config, doc_manager, git_operations, messages, overlay, toolchain_manager, vscode_tasks_manager,
 };
 use regex::Regex;
 use std::env;
@@ -39,25 +36,13 @@ use std::process::Command;
 
 /// Handle documentation commands
 pub(crate) fn handle_docs_command(docs_command: &DocsCommand) {
-    // Must be run from within a workspace
-    let workspace_path = match get_current_workspace() {
-        Ok(path) => path,
+    let (workspace_path, config_path) = match require_workspace_config() {
+        Ok(paths) => paths,
         Err(e) => {
-            messages::error(&format!("Error: {}", e));
+            messages::error(&e);
             return;
         }
     };
-
-    // Use sdk.yml from workspace root
-    let config_path = workspace_path.join("sdk.yml");
-    if !config_path.exists() {
-        messages::error(&format!(
-            "sdk.yml not found in workspace root: {}",
-            workspace_path.display()
-        ));
-        messages::error("The workspace may be corrupted. Try running 'cim init' to reinitialize.");
-        return;
-    }
 
     // Ensure documentation dependencies are available before any docs operations
     if let Err(e) = ensure_docs_dependencies(&workspace_path) {
@@ -70,7 +55,7 @@ pub(crate) fn handle_docs_command(docs_command: &DocsCommand) {
     }
 
     // For docs commands, we only need core config (git repos, mirror) - not os-dependencies
-    let sdk_config = match config::load_config(&config_path) {
+    let sdk_config = match load_config_with_extends(&config_path) {
         Ok(config) => config,
         Err(e) => {
             messages::error(&format!("Error loading config: {}", e));
@@ -165,25 +150,13 @@ pub(crate) fn handle_docs_command(docs_command: &DocsCommand) {
 
 /// Add a new git repository entry to the config file
 pub(crate) fn handle_add_command(name: &str, url: &str, commit: &str) {
-    // Must be run from within a workspace
-    let workspace_path = match get_current_workspace() {
-        Ok(path) => path,
+    let (_workspace_path, config_path) = match require_workspace_config() {
+        Ok(paths) => paths,
         Err(e) => {
-            messages::error(&format!("Error: {}", e));
+            messages::error(&e);
             return;
         }
     };
-
-    // Use sdk.yml from workspace root
-    let config_path = workspace_path.join("sdk.yml");
-    if !config_path.exists() {
-        messages::error(&format!(
-            "sdk.yml not found in workspace root: {}",
-            workspace_path.display()
-        ));
-        messages::error("The workspace may be corrupted. Try running 'cim init' to reinitialize.");
-        return;
-    }
 
     // First load the config to check for duplicates
     let sdk_config = match config::load_config(&config_path) {
@@ -226,80 +199,17 @@ pub(crate) fn handle_add_command(name: &str, url: &str, commit: &str) {
         name, url, commit
     );
 
-    // Find the gits section and append the new entry
-    let updated_content = if let Some(gits_pos) = original_content.find("gits:") {
-        // Check if gits is an empty array on the same line (gits: [])
-        let gits_line_start = gits_pos;
-        let gits_line_end = original_content[gits_pos..]
-            .find('\n')
-            .map(|pos| gits_pos + pos)
-            .unwrap_or(original_content.len());
-        let gits_line = &original_content[gits_line_start..gits_line_end];
-
-        if gits_line.contains("[]") {
-            // Replace "gits: []" with "gits:" followed by the new entry
-            let replacement = format!("gits:{}", new_git_yaml);
-            format!(
-                "{}{}{}",
-                &original_content[..gits_line_start],
-                replacement,
-                &original_content[gits_line_end..]
-            )
-        } else {
-            // Find the end of the gits section by scanning line by line.
-            // Only a real YAML key at column 0 (non-whitespace, non-comment) ends the section.
-            // Empty lines and comment lines (#...) are skipped.
-            let after_gits = &original_content[gits_pos..];
-
-            // Skip past the "gits:" line itself
-            let gits_key_line_len = after_gits
-                .find('\n')
-                .map(|p| p + 1)
-                .unwrap_or(after_gits.len());
-
-            // Default insert position: right after the "gits:" line (handles empty gits section)
-            let mut insert_pos = gits_pos + gits_key_line_len;
-            let mut scan_pos = gits_pos + gits_key_line_len;
-
-            while scan_pos < original_content.len() {
-                let line_start = scan_pos;
-                let line_end = original_content[scan_pos..]
-                    .find('\n')
-                    .map(|p| scan_pos + p + 1)
-                    .unwrap_or(original_content.len());
-
-                let line = &original_content[line_start..line_end];
-                let first_byte = line.bytes().next();
-
-                match first_byte {
-                    None | Some(b'\n') | Some(b'\r') => {
-                        // Empty line — could be between entries or between sections, skip
-                    }
-                    Some(b' ') | Some(b'\t') => {
-                        // Indented line → belongs to the current gits entry; advance insert_pos
-                        insert_pos = line_end;
-                    }
-                    Some(b'#') => {
-                        // Comment line → skip; belongs to the next section's header block
-                    }
-                    _ => {
-                        // Non-indented, non-comment line = start of the next YAML key, stop
-                        break;
-                    }
-                }
-                scan_pos = line_end;
-            }
-
-            format!(
-                "{}{}{}",
-                &original_content[..insert_pos],
-                new_git_yaml,
-                &original_content[insert_pos..]
-            )
+    // Insert the new entry into the gits section
+    let updated_content = match dsdk_cli::workspace::insert_yaml_section_entry(
+        &original_content,
+        "gits",
+        &new_git_yaml,
+    ) {
+        Ok(content) => content,
+        Err(e) => {
+            messages::error(&e);
+            return;
         }
-    } else {
-        messages::error("Could not find 'gits:' section in config file");
-        return;
     };
 
     // Write back to file
@@ -318,32 +228,25 @@ pub(crate) fn handle_add_command(name: &str, url: &str, commit: &str) {
 }
 
 /// Execute a command in each git repository workspace
-pub(crate) fn handle_foreach_command(command: &str, match_pattern: Option<&str>) {
-    // Must be run from within a workspace
-    let workspace_path = match get_current_workspace() {
-        Ok(path) => path,
+pub(crate) fn handle_foreach_command(
+    command: &str,
+    match_pattern: Option<&str>,
+    include_group: Option<&str>,
+    exclude_group: Option<&str>,
+) {
+    let (workspace_path, config_path) = match require_workspace_config() {
+        Ok(paths) => paths,
         Err(e) => {
-            messages::error(&format!("Error: {}", e));
+            messages::error(&e);
             return;
         }
     };
-
-    // Use sdk.yml from workspace root
-    let config_path = workspace_path.join("sdk.yml");
-    if !config_path.exists() {
-        messages::error(&format!(
-            "sdk.yml not found in workspace root: {}",
-            workspace_path.display()
-        ));
-        messages::error("The workspace may be corrupted. Try running 'cim init' to reinitialize.");
-        return;
-    }
     messages::status(&format!(
         "Executing command in workspace: {}",
         workspace_path.display()
     ));
 
-    let mut sdk_config = match config::load_config(&config_path) {
+    let sdk_config = match load_config_with_user_overrides(&config_path, false) {
         Ok(config) => config,
         Err(e) => {
             messages::error(&format!("Error loading config: {}", e));
@@ -353,17 +256,6 @@ pub(crate) fn handle_foreach_command(command: &str, match_pattern: Option<&str>)
             return;
         }
     };
-
-    // Load and apply user config overrides if present
-    match config::UserConfig::load() {
-        Ok(Some(user_config)) => {
-            user_config.apply_to_sdk_config(&mut sdk_config, false);
-        }
-        Ok(None) => {}
-        Err(e) => {
-            messages::error(&format!("Warning: Failed to load user config: {}", e));
-        }
-    }
 
     // Compile regex pattern if provided
     let match_regex = if let Some(pattern) = match_pattern {
@@ -381,8 +273,12 @@ pub(crate) fn handle_foreach_command(command: &str, match_pattern: Option<&str>)
         None
     };
 
-    // Create filtered config based on match pattern
-    let filtered_config = create_filtered_sdk_config(&sdk_config, &match_regex);
+    let include_groups = include_group.map(parse_group_list).unwrap_or_default();
+    let exclude_groups = exclude_group.map(parse_group_list).unwrap_or_default();
+
+    // Create filtered config based on match pattern and group selection
+    let filtered_config =
+        create_filtered_sdk_config(&sdk_config, &match_regex, &include_groups, &exclude_groups);
 
     messages::status(&format!(
         "Executing '{}' in each repository workspace...\n",
@@ -431,12 +327,12 @@ pub(crate) fn resolve_target_config(
 ) -> Result<PathBuf, anyhow::Error> {
     if is_url(target_name_or_url) {
         // Handle URL target - download the config file
-        let config_url = if target_name_or_url.ends_with("sdk.yml") {
+        let config_url = if target_name_or_url.ends_with(SDK_CONFIG_FILE) {
             target_name_or_url.to_string()
         } else if target_name_or_url.ends_with('/') {
-            format!("{}sdk.yml", target_name_or_url)
+            format!("{}{}", target_name_or_url, SDK_CONFIG_FILE)
         } else {
-            format!("{}/sdk.yml", target_name_or_url)
+            format!("{}/{}", target_name_or_url, SDK_CONFIG_FILE)
         };
 
         download_config_from_url(&config_url)
@@ -444,7 +340,7 @@ pub(crate) fn resolve_target_config(
     } else {
         // Handle local target name
         let target_dir = config_root.join("targets").join(target_name_or_url);
-        let main_config = target_dir.join("sdk.yml");
+        let main_config = target_dir.join(SDK_CONFIG_FILE);
 
         if !main_config.exists() {
             return Err(anyhow::anyhow!(
@@ -475,7 +371,7 @@ pub(crate) fn list_available_targets(config_root: &Path) -> Result<Vec<String>, 
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             let target_name = entry.file_name().to_string_lossy().to_string();
-            let config_path = entry.path().join("sdk.yml");
+            let config_path = entry.path().join(SDK_CONFIG_FILE);
 
             // Only include directories that have sdk.yml
             if config_path.exists() {
@@ -488,6 +384,383 @@ pub(crate) fn list_available_targets(config_root: &Path) -> Result<Vec<String>, 
     Ok(targets)
 }
 
+/// Result of resolving a target from one or more manifest sources.
+pub(crate) struct ResolvedTarget {
+    /// Path to the resolved sdk.yml
+    pub config_path: PathBuf,
+    /// The source URL or path that matched
+    pub source_path: String,
+    /// Whether the source was a remote git repo (or local with version checkout)
+    pub is_git_source: bool,
+    /// Index of the matched source (0 = default)
+    pub source_index: usize,
+}
+
+/// Returns "default" for index 0, "alternate" for any other index.
+pub(crate) fn source_label(index: usize) -> &'static str {
+    if index == 0 {
+        "default"
+    } else {
+        "alternate"
+    }
+}
+
+/// Search multiple manifest sources for a target, returning the first match.
+///
+/// Iterates through `sources` in order, attempting URL-based git resolution,
+/// local git resolution (when `version` is set), or direct local path resolution.
+/// Returns the first successful match.
+///
+/// # Arguments
+///
+/// * `target` - Target name to find
+/// * `version` - Optional version (branch/tag) to checkout
+/// * `sources` - Ordered list of source URLs or paths to search
+/// * `persistent_dir` - Optional directory for extracted files. If None, uses tempfile with mem::forget
+pub(crate) fn resolve_target_from_sources(
+    target: &str,
+    version: Option<&str>,
+    sources: &[String],
+    persistent_dir: Option<&Path>,
+) -> Result<ResolvedTarget, String> {
+    let multi_source = sources.len() > 1;
+
+    for (i, source_path) in sources.iter().enumerate() {
+        if is_url(source_path) {
+            match resolve_target_config_from_git(source_path, target, version, persistent_dir) {
+                Ok(path) => {
+                    return Ok(ResolvedTarget {
+                        config_path: path,
+                        source_path: source_path.clone(),
+                        is_git_source: true,
+                        source_index: i,
+                    });
+                }
+                Err(e) => {
+                    if !multi_source {
+                        return Err(e.to_string());
+                    }
+                    messages::verbose(&format!(
+                        "  Target '{}' not found in source: {}",
+                        target, source_path
+                    ));
+                }
+            }
+        } else {
+            let source_root = PathBuf::from(source_path);
+
+            if let Some(v) = version {
+                if source_root.join(".git").exists() {
+                    match resolve_target_config_from_git(
+                        source_path,
+                        target,
+                        Some(v),
+                        persistent_dir,
+                    ) {
+                        Ok(path) => {
+                            return Ok(ResolvedTarget {
+                                config_path: path,
+                                source_path: source_path.clone(),
+                                is_git_source: true,
+                                source_index: i,
+                            });
+                        }
+                        Err(e) => {
+                            if !multi_source {
+                                return Err(e.to_string());
+                            }
+                            messages::verbose(&format!("  Skipping {}: {}", source_path, e));
+                        }
+                    }
+                } else {
+                    if !multi_source {
+                        return Err(format!(
+                            "Version specified but source is not a git repository: {}",
+                            source_path
+                        ));
+                    }
+                    messages::verbose(&format!(
+                        "  Skipping {} (version specified but source is not a git repo)",
+                        source_path
+                    ));
+                }
+            } else {
+                match resolve_target_config(target, &source_root) {
+                    Ok(path) => {
+                        return Ok(ResolvedTarget {
+                            config_path: path,
+                            source_path: source_path.clone(),
+                            is_git_source: false,
+                            source_index: i,
+                        });
+                    }
+                    Err(_) => {
+                        if !multi_source {
+                            let mut msg =
+                                format!("Target '{}' not found in source {}", target, source_path);
+                            if let Ok(targets) = list_available_targets(&source_root) {
+                                msg.push_str("\nAvailable targets:");
+                                for t in targets {
+                                    msg.push_str(&format!("\n  - {}", t));
+                                }
+                            }
+                            return Err(msg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // No source had the target
+    let mut msg = format!(
+        "Target '{}' not found in any configured manifest source.",
+        target
+    );
+    msg.push_str("\nSearched sources:");
+    for (i, src) in sources.iter().enumerate() {
+        msg.push_str(&format!("\n  - {} ({})", src, source_label(i)));
+    }
+    msg.push_str("\n  Use 'cim list-targets' to see all available targets");
+    Err(msg)
+}
+
+/// Rewrite copy_files entries' local (non-URL, non-absolute) `source` paths
+/// to be absolute, resolved against `base_dir` (the directory containing
+/// the sdk.yml that declared them).
+///
+/// The primary target's own entries never need this: `process_copy_files`
+/// already resolves them against the primary's directory. But entries
+/// contributed by an `extends:` ancestor (or its own `overlay:` key) must
+/// resolve against THAT ancestor's own manifest directory instead --
+/// otherwise, for example, a base target's `source: extra.mk` would
+/// incorrectly be looked up inside the derived target's directory and
+/// silently fail to be found.
+pub(crate) fn resolve_local_copy_file_sources(
+    copy_files: &mut [config::CopyFileConfig],
+    base_dir: &Path,
+) {
+    for entry in copy_files.iter_mut() {
+        if !is_url(&entry.source) && !Path::new(&entry.source).is_absolute() {
+            entry.source = base_dir.join(&entry.source).to_string_lossy().to_string();
+        }
+    }
+}
+
+/// Find `os-dependencies.yml`/`python-dependencies.yml` sitting next to a
+/// single level's own sdk.yml (at `config_path`), returning `TargetFilePair`
+/// entries for whichever of the two exist, named the same way sdk.yml is:
+/// bare for the primary target, `<target>-<file>` for an ancestor. These
+/// files are not overlay-able -- each level's own file (if any) is simply
+/// copied in as-is; `cim install os-deps`/`cim install pip` process every
+/// discovered file independently (see `workspace::discover_dependency_files`).
+fn discover_sibling_dep_files(
+    config_path: &Path,
+    target: &str,
+    is_primary: bool,
+) -> Vec<TargetFilePair> {
+    let dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut pairs = Vec::new();
+    for base_filename in [OS_DEPS_FILE, PYTHON_DEPS_FILE] {
+        let source_path = dir.join(base_filename);
+        if source_path.exists() {
+            let dest_name = if is_primary {
+                base_filename.to_string()
+            } else {
+                format!("{}-{}", target, base_filename)
+            };
+            pairs.push(TargetFilePair {
+                dest_name,
+                dest_subdir: ancestor_dest_subdir(is_primary),
+                source_path,
+            });
+        }
+    }
+    pairs
+}
+
+/// `Some(workspace::OVERLAYS_DIR)` for an extends: ancestor's file, `None`
+/// for the primary target's own (bare-named, workspace-root) file.
+fn ancestor_dest_subdir(is_primary: bool) -> Option<&'static str> {
+    if is_primary {
+        None
+    } else {
+        Some(OVERLAYS_DIR)
+    }
+}
+
+/// One target's sdk.yml that must be copied into the workspace, along with
+/// the destination filename/subfolder it should get there. The primary
+/// (originally-requested) target always keeps the bare `sdk.yml` name at
+/// the workspace root; every ancestor in an `extends:` chain gets a
+/// `<target>-sdk.yml` name instead, placed under the
+/// `.cim/target-overlays/` subfolder (`workspace::OVERLAYS_DIR`).
+#[derive(Debug)]
+pub(crate) struct TargetFilePair {
+    pub(crate) dest_name: String,
+    pub(crate) dest_subdir: Option<&'static str>,
+    pub(crate) source_path: PathBuf,
+}
+
+/// Result of resolving a target's `extends:` chain against its manifest
+/// source(s): the fully merged, in-memory config (used for this init run's
+/// immediate actions), and the list of original files to copy into the
+/// workspace verbatim (nothing is ever flattened/serialized to disk).
+#[derive(Debug)]
+pub(crate) struct ExtendsResolution {
+    pub(crate) merged: config::SdkConfig,
+    pub(crate) files_to_copy: Vec<TargetFilePair>,
+}
+
+/// Maximum `extends:` chain depth, as a belt-and-braces safety net alongside
+/// cycle detection.
+const MAX_EXTENDS_DEPTH: usize = 20;
+
+/// Resolve a target's sdk.yml (and, if it declares `extends:`, its whole
+/// base chain) against its manifest source(s).
+///
+/// `config_path` must already point at a fetched/resolved sdk.yml for
+/// `target` (as produced by `resolve_target_config`/`resolve_target_from_sources`).
+/// `sources` is the list of manifest sources to search for ancestor targets
+/// that don't specify an explicit `extends.source` override.
+pub(crate) fn resolve_extends_chain_from_source(
+    config_path: &Path,
+    target: &str,
+    sources: &[String],
+) -> Result<ExtendsResolution, String> {
+    resolve_extends_chain_from_source_inner(
+        config_path,
+        target,
+        sources,
+        &mut std::collections::HashSet::new(),
+        0,
+    )
+}
+
+fn resolve_extends_chain_from_source_inner(
+    config_path: &Path,
+    target: &str,
+    sources: &[String],
+    visited: &mut std::collections::HashSet<String>,
+    depth: usize,
+) -> Result<ExtendsResolution, String> {
+    if depth > MAX_EXTENDS_DEPTH {
+        return Err(format!(
+            "extends: chain exceeds the maximum depth of {} (possible misconfiguration \
+             or unintended cycle involving target '{}')",
+            MAX_EXTENDS_DEPTH, target
+        ));
+    }
+
+    let mut derived = config::load_config(config_path)
+        .map_err(|e| format!("Failed to load config for target '{}': {}", target, e))?;
+
+    let is_primary = depth == 0;
+    let sdk_dest_name = if is_primary {
+        SDK_CONFIG_FILE.to_string()
+    } else {
+        format!("{}-{}", target, SDK_CONFIG_FILE)
+    };
+
+    // Ancestor-contributed copy_files entries with a local (non-URL,
+    // non-absolute) source path must resolve against THAT ancestor's own
+    // manifest directory, not the primary target's directory -- otherwise
+    // e.g. a base target's `source: extra.mk` would be looked up (and fail
+    // to be found) inside the derived target's own directory instead. The
+    // primary's own entries need no rewriting: process_copy_files already
+    // resolves them against the primary's directory.
+    if !is_primary {
+        if let Some(copy_files) = &mut derived.copy_files {
+            let ancestor_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+            resolve_local_copy_file_sources(copy_files, ancestor_dir);
+        }
+    }
+
+    let Some(extends) = derived.extends.clone() else {
+        let mut files_to_copy = vec![TargetFilePair {
+            dest_name: sdk_dest_name,
+            dest_subdir: ancestor_dest_subdir(is_primary),
+            source_path: config_path.to_path_buf(),
+        }];
+        files_to_copy.extend(discover_sibling_dep_files(config_path, target, is_primary));
+        return Ok(ExtendsResolution {
+            merged: derived,
+            files_to_copy,
+        });
+    };
+
+    if !visited.insert(target.to_string()) {
+        return Err(format!(
+            "extends: cycle detected involving target '{}' (already visited: {})",
+            target,
+            visited.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    let base_sources: Vec<String> = match &extends.source {
+        Some(src) => vec![src.clone()],
+        None => sources.to_vec(),
+    };
+
+    let resolved_base = resolve_target_from_sources(
+        &extends.target,
+        extends.version.as_deref(),
+        &base_sources,
+        None,
+    )
+    .map_err(|e| {
+        format!(
+            "extends: failed to resolve base target '{}' (declared by '{}'): {}",
+            extends.target, target, e
+        )
+    })?;
+
+    let base_resolution = resolve_extends_chain_from_source_inner(
+        &resolved_base.config_path,
+        &extends.target,
+        &base_sources,
+        visited,
+        depth + 1,
+    )?;
+
+    let mut overlay_config = derived.overlay.clone().unwrap_or_default();
+
+    // Same rewriting as above, but for copy_files entries modified by this
+    // level's own `overlay:` key (only relevant when this level isn't the
+    // primary target). New entries never go through `overlay:`'s add: --
+    // they live directly in that ancestor's own sdk.yml, already handled
+    // by the `derived.copy_files` rewrite above.
+    if !is_primary {
+        if let Some(copy_files_overlay) = &mut overlay_config.copy_files {
+            let ancestor_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+            for patch in &mut copy_files_overlay.modify {
+                if let Some(source) = &patch.source {
+                    if !is_url(source) && !Path::new(source).is_absolute() {
+                        patch.source =
+                            Some(ancestor_dir.join(source).to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut files_to_copy = vec![TargetFilePair {
+        dest_name: sdk_dest_name,
+        dest_subdir: ancestor_dest_subdir(is_primary),
+        source_path: config_path.to_path_buf(),
+    }];
+    files_to_copy.extend(discover_sibling_dep_files(config_path, target, is_primary));
+    files_to_copy.extend(base_resolution.files_to_copy);
+
+    let merged = overlay::apply_overlay(base_resolution.merged, derived, &overlay_config)
+        .map_err(|e| format!("Failed to apply overlay for target '{}': {}", target, e))?;
+
+    Ok(ExtendsResolution {
+        merged,
+        files_to_copy,
+    })
+}
+
 /// Helper function to install OS dependencies during init if they exist
 /// This function is called by init --full to install OS packages before other components
 pub(crate) fn install_os_deps_if_available(
@@ -495,30 +768,13 @@ pub(crate) fn install_os_deps_if_available(
     skip_prompt: bool,
     no_sudo: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Check if os-dependencies.yml exists
-    let os_deps_path = workspace_path.join("os-dependencies.yml");
-    if !os_deps_path.exists() {
+    // Processes every os-dependencies.yml-family file in the workspace: the
+    // primary target's own file, plus one per extends: ancestor.
+    if !crate::install_cmd::install_os_deps_from_workspace(workspace_path, skip_prompt, no_sudo) {
         messages::status(
             "No os-dependencies.yml found in workspace, skipping OS dependencies installation",
         );
-        return Ok(());
     }
-
-    // Load OS dependencies
-    let os_deps = match config::load_os_dependencies(&os_deps_path) {
-        Ok(deps) => deps,
-        Err(e) => {
-            messages::info(&format!(
-                "Skipping OS dependencies installation: Failed to load os-dependencies.yml: {}",
-                e
-            ));
-            return Ok(()); // Non-fatal, continue with next steps
-        }
-    };
-
-    // Call install_prerequisites which will display package list and prompt for confirmation
-    // unless skip_prompt is true (from --yes flag)
-    install_prerequisites(&os_deps, skip_prompt, no_sudo);
 
     Ok(())
 }
@@ -528,6 +784,7 @@ pub(crate) fn install_os_deps_if_available(
 pub(crate) fn install_toolchains_if_available(
     workspace_path: &Path,
     config_path: &Path,
+    mirror_path: &Path,
     symlink: bool,
     _verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -552,11 +809,10 @@ pub(crate) fn install_toolchains_if_available(
     messages::status("");
     messages::status("Installing toolchains...");
 
-    // Mirror path already expanded in full_config with user overrides applied
     // Create toolchain manager and install toolchains
     let toolchain_manager = toolchain_manager::ToolchainManager::new(
         workspace_path.to_path_buf(),
-        full_config.mirror.clone(),
+        mirror_path.to_path_buf(),
     );
 
     match toolchain_manager.install_toolchains(
@@ -582,9 +838,13 @@ pub(crate) fn install_toolchains_if_available(
 pub(crate) fn install_pip_packages_if_available(
     workspace_path: &Path,
     config_path: &Path,
+    mirror_path: &Path,
     symlink: bool,
+    pattern_regex: &Option<Regex>,
+    include_groups: &[String],
+    exclude_groups: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Load the SDK config with user overrides to get the mirror path
+    // Load the SDK config to validate the manifest parses.
     let sdk_config = match load_config_with_user_overrides(config_path, false) {
         Ok(config) => config,
         Err(e) => {
@@ -596,57 +856,44 @@ pub(crate) fn install_pip_packages_if_available(
         }
     };
 
-    // Check if python-dependencies.yml exists
-    let python_deps_path = workspace_path.join("python-dependencies.yml");
-    if !python_deps_path.exists() {
-        messages::status(
-            "No python-dependencies.yml found in workspace, skipping pip installation",
-        );
-        return Ok(());
-    }
-
-    // Load Python dependencies to check if there are packages to install
-    let python_deps = match config::load_python_dependencies(&python_deps_path) {
-        Ok(deps) => deps,
-        Err(e) => {
-            messages::info(&format!(
-                "Skipping pip installation: Failed to load python-dependencies.yml: {}",
-                e
-            ));
-            return Ok(()); // Non-fatal, continue with next steps
+    // Install per-repo Python deps declared in sdk.yml gits: entries into
+    // isolated venvs at .cim/<git>/.venv. This is independent of
+    // python-dependencies.yml, so it runs even when that file is absent.
+    // Only consider gits that survived the same match/group filtering used
+    // to decide which repos actually got cloned -- otherwise this reaches
+    // into checkouts that were deliberately excluded and don't exist.
+    let group_filtered_gits =
+        filter_git_configs_by_group(&sdk_config.gits, include_groups, exclude_groups);
+    let filtered_gits = filter_git_configs(&group_filtered_gits, pattern_regex);
+    for git in &filtered_gits {
+        if let Some(reqs) = &git.python_deps {
+            messages::status("");
+            install_git_python_deps(workspace_path, &git.name, reqs, false)?;
         }
-    };
-
-    // Check if the default profile has any packages
-    let has_packages = python_deps
-        .profiles
-        .get(&python_deps.default)
-        .map(|profile| !profile.packages.is_empty())
-        .unwrap_or(false);
-
-    if !has_packages {
-        messages::status(&format!(
-            "No Python packages in default profile '{}', skipping pip installation",
-            python_deps.default
-        ));
-        return Ok(());
     }
 
+    // Install Python packages from every python-dependencies.yml-family
+    // file in the workspace: the primary target's own file, plus one per
+    // extends: ancestor. Each file's own default profile is used.
     messages::status("");
-    messages::status("Installing Python packages...");
-
-    // Mirror path already expanded in sdk_config with user overrides applied
-    // Install Python packages using the default profile
-    install_python_packages_from_file(
-        &python_deps_path,
-        false,   // force = false
-        symlink, // symlink = from parameter
-        None,    // profile = None (use default)
+    match crate::install_cmd::install_pip_from_workspace(
         workspace_path,
-        &sdk_config.mirror,
-    )?;
+        false, // force = false
+        symlink,
+        None, // profile = None (use each file's own default)
+        mirror_path,
+    ) {
+        Ok(true) => {
+            messages::success("Python packages installation completed");
+        }
+        Ok(false) => {
+            messages::status(
+                "No python-dependencies.yml found in workspace, skipping pip installation",
+            );
+        }
+        Err(e) => return Err(e),
+    }
 
-    messages::success("Python packages installation completed");
     Ok(())
 }
 
@@ -657,8 +904,11 @@ pub(crate) struct InitConfig<'a> {
     pub(crate) version: Option<String>,
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) no_mirror: bool,
+    pub(crate) mirror: Option<PathBuf>,
     pub(crate) force: bool,
     pub(crate) match_pattern: Option<&'a str>,
+    pub(crate) include_group: Option<&'a str>,
+    pub(crate) exclude_group: Option<&'a str>,
     pub(crate) verbose: bool,
     pub(crate) install: bool,
     pub(crate) full: bool,
@@ -666,6 +916,44 @@ pub(crate) struct InitConfig<'a> {
     pub(crate) symlink: bool,
     pub(crate) yes: bool,
     pub(crate) _cert_validation: Option<&'a str>,
+}
+
+/// Write .envrc and trust the workspace with direnv.
+///
+/// In symlink mode, .venv points to a shared mirror venv. The generated .envrc resolves the
+/// symlink target and creates the venv at that canonical target path when needed to avoid
+/// workspace-specific shebangs in shared scripts.
+pub(crate) fn setup_direnv(
+    workspace_path: &std::path::Path,
+    direnv_cfg: &dsdk_cli::config::DirenvConfig,
+    symlink: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let venv = direnv_cfg.venv_path_or_default();
+
+    let envrc_content = if symlink {
+        format!(
+            "if [ -L \"{venv}\" ] ; then\n  _venv_target=\"$(readlink \"{venv}\")\"\n  case \"$_venv_target\" in\n    /*) ;;\n    *) _venv_target=\"$(cd \"$(dirname \"{venv}\")\" && pwd)/$_venv_target\" ;;\n  esac\n  if [ ! -d \"$_venv_target\" ] ; then\n    python3 -m venv \"$_venv_target\"\n  fi\nelif [ ! -d \"{venv}\" ] ; then\n  python3 -m venv {venv}\nfi\n. {venv}/bin/activate\n"
+        )
+    } else {
+        format!(
+            "if [ ! -d \"{venv}\" ] ; then\n  python3 -m venv {venv}\nfi\n. {venv}/bin/activate\n"
+        )
+    };
+    std::fs::write(workspace_path.join(".envrc"), &envrc_content)?;
+
+    // Trust the workspace with direnv (best-effort; direnv may not be installed yet).
+    let _ = std::process::Command::new("direnv")
+        .arg("allow")
+        .arg(".")
+        .current_dir(workspace_path)
+        .status();
+
+    messages::status("");
+    messages::success("direnv: wrote .envrc");
+    messages::status("   To activate direnv automatically, add to your ~/.bashrc (or ~/.zshrc):");
+    messages::status("    eval \"$(direnv hook bash)\"   # replace 'bash' with zsh/fish as needed");
+
+    Ok(())
 }
 
 /// Initialize a new workspace
@@ -692,163 +980,101 @@ pub(crate) fn handle_init_command(config: InitConfig) {
         }
     };
 
-    // Determine source path (use user config default if available)
-    let default_source = if let Some(ref uc) = user_config {
-        if let Some(ref ds) = uc.default_source {
-            ds.clone()
-        } else {
-            get_default_source()
-        }
+    // Determine all sources to search
+    let sources: Vec<String> = if let Some(ref src) = config.source {
+        // Explicit --source: use only that source
+        vec![src.clone()]
     } else {
-        get_default_source()
+        get_all_sources_from_config(user_config.as_ref())
     };
 
-    let (source_path, using_user_config_source) = if let Some(src) = config.source {
-        // Explicit source provided, not using user config default
-        (src, false)
-    } else {
-        // No explicit source, check if we have user config default
-        let using_user_default = if let Some(ref uc) = user_config {
-            uc.default_source.is_some()
-        } else {
-            false
-        };
-        if using_user_default {
-            messages::verbose(&format!(
-                "Using default_source from user config: {}",
-                default_source
-            ));
-        }
-        (default_source, using_user_default)
-    };
+    if sources.len() > 1 {
+        messages::verbose(&format!(
+            "Searching {} manifest sources for target '{}'",
+            sources.len(),
+            config.target
+        ));
+    }
 
-    // Track whether we're using a remote git source for copy_files processing
-    let mut is_remote_git_source = false;
-
-    // For now, simplified approach: check if target itself is a URL first, otherwise use source
-    let (config_path, config_url) = if is_url(&config.target) {
-        // Target is a direct URL to config file
-        match resolve_target_config(&config.target, &PathBuf::new()) {
-            Ok(path) => (path, Some(config.target.clone())),
-            Err(e) => {
-                messages::error(&e.to_string());
-                return;
-            }
-        }
-    } else {
-        // Use source to resolve target config
-        if is_url(&source_path) {
-            // Git-based source - clone and checkout specific version
-            match resolve_target_config_from_git(
-                &source_path,
-                &config.target,
-                config.version.as_deref(),
-                None, // Use tempfile with mem::forget for init
-            ) {
-                Ok(path) => {
-                    let version_info = if let Some(v) = &config.version {
-                        format!(" ({})", v)
-                    } else {
-                        " (latest)".to_string()
-                    };
-                    let source_info = if using_user_config_source {
-                        " (user config default_source)"
-                    } else {
-                        ""
-                    };
-                    messages::status(&format!(
-                        "Setting up for target '{}'{} using source: {}{}",
-                        config.target, version_info, source_path, source_info
-                    ));
-                    // Mark that we're using a remote git source for copy_files processing
-                    is_remote_git_source = true;
-                    (path, None) // Use None for git-based configs since dependency files are locally available
-                }
+    // Check if target itself is a URL first, otherwise search sources
+    let (config_path, config_url, is_remote_git_source, resolved_source_path) =
+        if is_url(&config.target) {
+            match resolve_target_config(&config.target, &PathBuf::new()) {
+                Ok(path) => (path, Some(config.target.clone()), false, None),
                 Err(e) => {
                     messages::error(&e.to_string());
                     return;
                 }
             }
         } else {
-            // Local source directory
-            let source_root = PathBuf::from(&source_path);
-
-            // Check if version is specified and source is a git repository
-            if let Some(v) = config.version.as_deref() {
-                if source_root.join(".git").exists() {
-                    // Clone local git repo to temp dir and checkout specific version
-                    match resolve_target_config_from_git(
-                        &source_path,
-                        &config.target,
-                        Some(v),
-                        None,
-                    ) {
-                        Ok(path) => {
-                            messages::verbose(&format!(
-                                "Checked out config for target '{}' at version '{}'",
-                                config.target, v
-                            ));
-                            // Mark that we're using a remote git source for copy_files processing
-                            is_remote_git_source = true;
-                            (path, None)
-                        }
-                        Err(e) => {
-                            messages::error(&e.to_string());
-                            return;
-                        }
-                    }
-                } else {
-                    messages::error(&format!(
-                        "Version specified but source is not a git repository: {}",
-                        source_path
+            match resolve_target_from_sources(
+                &config.target,
+                config.version.as_deref(),
+                &sources,
+                None, // Use tempfile with mem::forget for init
+            ) {
+                Ok(resolved) => {
+                    let version_info = if let Some(v) = &config.version {
+                        format!(" ({})", v)
+                    } else if resolved.is_git_source {
+                        " (latest)".to_string()
+                    } else {
+                        String::new()
+                    };
+                    let label = if sources.len() > 1 {
+                        format!(" ({} source)", source_label(resolved.source_index))
+                    } else if config.source.is_none()
+                        && user_config
+                            .as_ref()
+                            .and_then(|uc| uc.default_source.as_ref())
+                            .is_some()
+                    {
+                        " (user config default_source)".to_string()
+                    } else {
+                        String::new()
+                    };
+                    messages::status(&format!(
+                        "Setting up for target '{}'{} using source: {}{}",
+                        config.target, version_info, resolved.source_path, label
                     ));
+                    (
+                        resolved.config_path,
+                        None,
+                        resolved.is_git_source,
+                        Some(resolved.source_path),
+                    )
+                }
+                Err(e) => {
+                    messages::error(&e);
                     return;
                 }
-            } else {
-                // No version specified, use current state directly
-                match resolve_target_config(&config.target, &source_root) {
-                    Ok(path) => {
-                        if using_user_config_source {
-                            messages::status(&format!(
-                                "Setting up for target '{}' using source: {} (user config default_source)",
-                                config.target, source_path
-                            ));
-                        }
-                        (path, None)
-                    }
-                    Err(e) => {
-                        messages::error(&format!("Error: {}", e));
-                        messages::status("Available targets:");
-                        if let Ok(targets) = list_available_targets(&source_root) {
-                            for target in targets {
-                                messages::status(&format!("  - {}", target));
-                            }
-                        } else {
-                            messages::status(&format!(
-                                "  (Could not list targets from {})",
-                                source_root.display()
-                            ));
-                        }
-                        return;
-                    }
-                }
             }
-        }
-    };
+        };
 
     messages::verbose(&format!(
         "Loading configuration from {}",
         config_path.display()
     ));
 
-    // Load and validate config
-    let mut sdk_config = match config::load_config(&config_path) {
-        Ok(config) => config,
-        Err(e) => {
-            messages::error(&format!("Failed to load config: {}", e));
-            return;
-        }
-    };
+    // Load and validate config, resolving extends:/overlay: against the
+    // manifest source(s) if the target declares extends:
+    let extends_resolution =
+        match resolve_extends_chain_from_source(&config_path, &config.target, &sources) {
+            Ok(resolution) => resolution,
+            Err(e) => {
+                messages::error(&format!("Failed to load config: {}", e));
+                return;
+            }
+        };
+    let mut sdk_config = extends_resolution.merged;
+
+    // Validate that build_depends_on/git_depends_on/install depends_on all
+    // resolve after merging the extends: chain (a no-op check when the
+    // target doesn't use extends: at all).
+    if let Err(e) = overlay::validate_dependencies(&sdk_config) {
+        messages::error(&e);
+        return;
+    }
 
     // Apply user config overrides if present
     if let Some(ref uc) = user_config {
@@ -861,19 +1087,9 @@ pub(crate) fn handle_init_command(config: InitConfig) {
         }
     }
 
-    // Expand environment variables in mirror path
-    let original_mirror = sdk_config.mirror.to_string_lossy().to_string();
-    let expanded_mirror = expand_config_mirror_path(&sdk_config);
-    if original_mirror != expanded_mirror.to_string_lossy() {
-        messages::verbose(&format!(
-            "Mirror: {} -> {}",
-            original_mirror,
-            expanded_mirror.display()
-        ));
-    } else {
-        messages::verbose(&format!("Mirror: {}", expanded_mirror.display()));
-    }
-    sdk_config.mirror = expanded_mirror;
+    // Resolve the mirror directory: --mirror flag > user config > built-in default.
+    let mirror_path = resolve_mirror(config.mirror.as_deref());
+    messages::verbose(&format!("Mirror: {}", mirror_path.display()));
 
     // Expand environment variables in git repository URLs
     for git in &mut sdk_config.gits {
@@ -885,33 +1101,7 @@ pub(crate) fn handle_init_command(config: InitConfig) {
     }
 
     // Expand manifest ${{ VAR }} variables in path/URL fields
-    if let Some(raw_vars) = sdk_config.variables.clone() {
-        let vars = resolve_variables(&raw_vars);
-
-        for git in &mut sdk_config.gits {
-            git.url = expand_manifest_vars(&git.url, &vars);
-        }
-
-        if let Some(ref mut toolchains) = sdk_config.toolchains {
-            for tc in toolchains.iter_mut() {
-                if let Some(ref name) = tc.name.clone() {
-                    tc.name = Some(expand_manifest_vars(name, &vars));
-                }
-                tc.url = expand_manifest_vars(&tc.url.clone(), &vars);
-                tc.destination = expand_manifest_vars(&tc.destination.clone(), &vars);
-                if let Some(ref md) = tc.mirror_destination.clone() {
-                    tc.mirror_destination = Some(expand_manifest_vars(md, &vars));
-                }
-            }
-        }
-
-        if let Some(ref mut copy_files) = sdk_config.copy_files {
-            for cf in copy_files.iter_mut() {
-                cf.source = expand_manifest_vars(&cf.source.clone(), &vars);
-                cf.dest = expand_manifest_vars(&cf.dest.clone(), &vars);
-            }
-        }
-    }
+    expand_manifest_vars_in_config(&mut sdk_config);
 
     // Compile regex pattern if provided
     let match_regex = if let Some(pattern) = config.match_pattern {
@@ -929,6 +1119,16 @@ pub(crate) fn handle_init_command(config: InitConfig) {
         None
     };
 
+    // Parse group include/exclude selections, if provided
+    let include_groups = config
+        .include_group
+        .map(parse_group_list)
+        .unwrap_or_default();
+    let exclude_groups = config
+        .exclude_group
+        .map(parse_group_list)
+        .unwrap_or_default();
+
     // Determine workspace path (default: $HOME/{prefix}{target-name} or user config)
     let workspace_path = config.workspace.unwrap_or_else(|| {
         if let Some(ref uc) = user_config {
@@ -943,19 +1143,19 @@ pub(crate) fn handle_init_command(config: InitConfig) {
             .unwrap_or_else(|| "dsdk-".to_string());
         // Use {prefix}{target-name} as default workspace name
         let workspace_name = format!("{}{}", prefix, config.target);
-        env::var("HOME")
-            .or_else(|_| env::var("USERPROFILE"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."))
+        get_home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
             .join(workspace_name)
     });
 
     // Expand environment variables in workspace path (e.g., $HOME, ~/path)
     let workspace_path = PathBuf::from(expand_env_vars(&workspace_path.to_string_lossy()));
 
-    // Canonicalize the workspace path if it exists, or make it absolute if it's relative
+    // Canonicalize the workspace path if it exists, or make it absolute if it's relative.
+    // Strip the Windows extended-length prefix \\?\ that canonicalize() adds on Windows,
+    // since git does not accept that prefix in destination paths.
     let workspace_path = if workspace_path.exists() {
-        workspace_path.canonicalize().unwrap_or(workspace_path)
+        git_operations::strip_unc_prefix(workspace_path.canonicalize().unwrap_or(workspace_path))
     } else if workspace_path.is_relative() {
         env::current_dir()
             .ok()
@@ -1006,7 +1206,7 @@ pub(crate) fn handle_init_command(config: InitConfig) {
             }
             messages::success("Removed existing workspace directory");
         } else {
-            let marker_path = workspace_path.join(".workspace");
+            let marker_path = workspace_path.join(WORKSPACE_MARKER_FILE);
             if marker_path.exists() {
                 messages::error(&format!(
                     "Workspace already initialized at {}",
@@ -1029,12 +1229,39 @@ pub(crate) fn handle_init_command(config: InitConfig) {
         return;
     }
 
-    // Copy config file to workspace as sdk.yml
-    let dest_config_path = workspace_path.join("sdk.yml");
-    if let Err(e) = fs::copy(&config_path, &dest_config_path) {
-        messages::error(&format!("Error copying config to workspace: {}", e));
-        return;
+    // Copy config file(s) to workspace. For a plain (non-extends) target this
+    // is just sdk.yml, byte-for-byte, exactly as before. For an extends:
+    // target, every level of the chain is copied verbatim under its own
+    // name: sdk.yml (and os/python deps files) for the primary target at
+    // the workspace root, <target>-sdk.yml (and <target>-os/python-deps
+    // files) for each ancestor under the .cim/target-overlays/ subfolder --
+    // nothing is ever flattened.
+    for file_pair in &extends_resolution.files_to_copy {
+        let dest_dir = match file_pair.dest_subdir {
+            Some(subdir) => {
+                let dir = workspace_path.join(subdir);
+                if let Err(e) = fs::create_dir_all(&dir) {
+                    messages::error(&format!(
+                        "Error creating {} directory: {}",
+                        dir.display(),
+                        e
+                    ));
+                    return;
+                }
+                dir
+            }
+            None => workspace_path.clone(),
+        };
+        let dest_path = dest_dir.join(&file_pair.dest_name);
+        if let Err(e) = fs::copy(&file_pair.source_path, &dest_path) {
+            messages::error(&format!(
+                "Error copying {} to workspace: {}",
+                file_pair.dest_name, e
+            ));
+            return;
+        }
     }
+    let dest_config_path = workspace_path.join(SDK_CONFIG_FILE);
     messages::verbose("Copied configuration to workspace as sdk.yml");
 
     // Determine if we should skip mirror (command line flag OR user config setting)
@@ -1049,17 +1276,20 @@ pub(crate) fn handle_init_command(config: InitConfig) {
     // Always use target name as original identifier for both URL-based and local targets
     if let Err(e) = create_workspace_marker(CreateWorkspaceMarkerParams {
         workspace_path: &workspace_path,
-        config_name: "sdk.yml",
+        config_name: SDK_CONFIG_FILE,
         original_config_path: &config_path,
-        mirror_path: &sdk_config.mirror,
+        mirror_path: &mirror_path,
         original_identifier: Some(&config.target),
         target_version: config.version.as_deref(),
         skip_mirror,
         source_url: if is_remote_git_source {
-            Some(&source_path)
+            resolved_source_path.as_deref()
         } else {
             None
         },
+        match_pattern: config.match_pattern,
+        include_group: config.include_group,
+        exclude_group: config.exclude_group,
     }) {
         messages::error(&format!("Error creating workspace marker: {}", e));
         return;
@@ -1076,7 +1306,8 @@ pub(crate) fn handle_init_command(config: InitConfig) {
     }
 
     // Create filtered config based on match pattern
-    let filtered_config = create_filtered_sdk_config(&sdk_config, &match_regex);
+    let filtered_config =
+        create_filtered_sdk_config(&sdk_config, &match_regex, &include_groups, &exclude_groups);
 
     // Show workspace status (similar to update command)
     messages::verbose(&format!("Workspace: {}", workspace_path.display()));
@@ -1088,15 +1319,20 @@ pub(crate) fn handle_init_command(config: InitConfig) {
         } else {
             messages::info("Skipping mirror operations (no_mirror = true in user config)");
         }
-        update_workspace_repos_no_mirror_with_result(&filtered_config, &workspace_path, true)
+        update_workspace_repos_with_result(&filtered_config, &workspace_path, true, None)
     } else {
-        messages::verbose(&format!("Mirror: {}", sdk_config.mirror().display()));
+        messages::verbose(&format!("Mirror: {}", mirror_path.display()));
 
         // Update mirror repositories
-        update_mirror_repos(&filtered_config);
+        update_mirror_repos(&filtered_config, &mirror_path);
 
         // Update workspace repositories
-        update_workspace_repos_with_result(&filtered_config, &workspace_path, true)
+        update_workspace_repos_with_result(
+            &filtered_config,
+            &workspace_path,
+            true,
+            Some(&mirror_path),
+        )
     };
 
     // Process copy_files after git repositories are cloned
@@ -1108,7 +1344,6 @@ pub(crate) fn handle_init_command(config: InitConfig) {
                 copy_files.len()
             ));
             let config_source_dir = config_path.parent().unwrap_or(Path::new("."));
-            let mirror_path = expand_config_mirror_path(&sdk_config);
             if let Err(e) = process_copy_files(
                 &workspace_path,
                 config_source_dir,
@@ -1174,6 +1409,7 @@ pub(crate) fn handle_init_command(config: InitConfig) {
             if let Err(e) = install_toolchains_if_available(
                 &workspace_path,
                 &dest_config_path,
+                &mirror_path,
                 config.symlink,
                 config.verbose,
             ) {
@@ -1187,7 +1423,11 @@ pub(crate) fn handle_init_command(config: InitConfig) {
             if let Err(e) = install_pip_packages_if_available(
                 &workspace_path,
                 &dest_config_path,
+                &mirror_path,
                 config.symlink,
+                &match_regex,
+                &include_groups,
+                &exclude_groups,
             ) {
                 messages::error(&format!("Failed to install Python packages: {}", e));
                 messages::error("Workspace creation failed");
@@ -1197,95 +1437,94 @@ pub(crate) fn handle_init_command(config: InitConfig) {
             // Step 3: Generate Makefile and run install-all (original --install behavior)
             // First generate the Makefile
             let makefile_path = workspace_path.join("Makefile");
-            match config::load_config(&dest_config_path) {
-                Ok(sdk_config) => {
-                    // Check if there are install sections before trying to run make install-all
-                    let has_install_sections = sdk_config.install.is_some()
-                        && sdk_config
-                            .install
-                            .as_ref()
-                            .map(|i| !i.is_empty())
-                            .unwrap_or(false);
+            let makefile_sdk_config = filtered_sdk_config_for_makefile(
+                &sdk_config,
+                &match_regex,
+                &include_groups,
+                &exclude_groups,
+            );
 
-                    let dividers = !user_config
-                        .as_ref()
-                        .and_then(|uc| uc.no_dividers)
-                        .unwrap_or(false);
-                    let makefile_content = generate_makefile_content(&sdk_config, dividers);
-                    match std::fs::write(&makefile_path, makefile_content) {
-                        Ok(_) => {
-                            messages::verbose(&format!(
-                                "Generated Makefile at {}",
-                                makefile_path.display()
-                            ));
+            // Check if there are install sections before trying to run make install-all
+            let has_install_sections = makefile_sdk_config.install.is_some()
+                && makefile_sdk_config
+                    .install
+                    .as_ref()
+                    .map(|i| !i.is_empty())
+                    .unwrap_or(false);
 
-                            // Generate VS Code tasks.json
-                            if let Err(e) = vscode_tasks_manager::generate_tasks_json(
-                                &workspace_path,
-                                &makefile_path,
-                            ) {
-                                messages::verbose(&format!(
-                                    "Could not generate VS Code tasks.json: {}",
+            let dividers = !user_config
+                .as_ref()
+                .and_then(|uc| uc.no_dividers)
+                .unwrap_or(false);
+            let makefile_content =
+                generate_makefile_content(&makefile_sdk_config, dividers, Some(&workspace_path));
+            match std::fs::write(&makefile_path, makefile_content) {
+                Ok(_) => {
+                    messages::verbose(&format!(
+                        "Generated Makefile at {}",
+                        makefile_path.display()
+                    ));
+
+                    // Generate VS Code tasks.json
+                    if let Err(e) =
+                        vscode_tasks_manager::generate_tasks_json(&workspace_path, &makefile_path)
+                    {
+                        messages::verbose(&format!("Could not generate VS Code tasks.json: {}", e));
+                    }
+
+                    // Only run make install-all if there are install sections in sdk.yml
+                    if has_install_sections {
+                        messages::status("");
+                        messages::status("Running install-all to complete SDK setup...");
+
+                        let make_status = std::process::Command::new("make")
+                            .arg("install-all")
+                            .current_dir(&workspace_path)
+                            .status();
+
+                        match make_status {
+                            Ok(status) => {
+                                if status.success() {
+                                    messages::status("");
+                                    messages::success("All SDK components installed successfully");
+                                } else {
+                                    messages::status("");
+                                    messages::error("Warning: Some components failed to install");
+                                    messages::status(&format!(
+                                        "You can retry with: cd {} && make install-all",
+                                        workspace_path.display()
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                messages::error(&format!(
+                                    "Warning: Failed to run make install-all: {}",
                                     e
                                 ));
-                            }
-
-                            // Only run make install-all if there are install sections in sdk.yml
-                            if has_install_sections {
-                                messages::status("");
-                                messages::status("Running install-all to complete SDK setup...");
-
-                                let make_status = std::process::Command::new("make")
-                                    .arg("install-all")
-                                    .current_dir(&workspace_path)
-                                    .status();
-
-                                match make_status {
-                                    Ok(status) => {
-                                        if status.success() {
-                                            messages::status("");
-                                            messages::success(
-                                                "All SDK components installed successfully",
-                                            );
-                                        } else {
-                                            messages::status("");
-                                            messages::error(
-                                                "Warning: Some components failed to install",
-                                            );
-                                            messages::status(&format!(
-                                                "You can retry with: cd {} && make install-all",
-                                                workspace_path.display()
-                                            ));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        messages::error(&format!(
-                                            "Warning: Failed to run make install-all: {}",
-                                            e
-                                        ));
-                                        messages::status(&format!("Make sure 'make' is installed, or run manually: cd {} && make install-all", workspace_path.display()));
-                                    }
-                                }
-                            } else {
-                                messages::status("");
-                                messages::status(
-                                    "No install targets in sdk.yml, skipping install-all step",
-                                );
-                                messages::success("Workspace setup completed");
+                                messages::status(&format!("Make sure 'make' is installed, or run manually: cd {} && make install-all", workspace_path.display()));
                             }
                         }
-                        Err(e) => {
-                            messages::error(&format!("Warning: Failed to write Makefile: {}", e));
-                            messages::status("You can generate it later with 'cim makefile'");
-                        }
+                    } else {
+                        messages::status("");
+                        messages::status(
+                            "No install targets in sdk.yml, skipping install-all step",
+                        );
+                        messages::success("Workspace setup completed");
                     }
                 }
                 Err(e) => {
-                    messages::error(&format!(
-                        "Warning: Failed to load config for Makefile generation: {}",
-                        e
-                    ));
+                    messages::error(&format!("Warning: Failed to write Makefile: {}", e));
                     messages::status("You can generate it later with 'cim makefile'");
+                }
+            }
+        }
+
+        // Set up direnv after install steps. In symlink mode, install may create .venv symlink,
+        // and .envrc should respect that canonical target path.
+        if let Some(direnv_cfg) = sdk_config.direnv() {
+            if direnv_cfg.used {
+                if let Err(e) = setup_direnv(&workspace_path, direnv_cfg, config.symlink) {
+                    messages::info(&format!("Note: direnv setup encountered an issue: {}", e));
                 }
             }
         }
@@ -1298,8 +1537,8 @@ pub(crate) fn handle_init_command(config: InitConfig) {
 /// Temporary struct to hold filtered git configurations for operations
 pub(crate) struct FilteredSdkConfig {
     pub(crate) gits: Vec<config::GitConfig>,
-    pub(crate) mirror: PathBuf,
-    pub(crate) makefile_include: Option<Vec<String>>,
+    pub(crate) makefile_include: Option<config::MakefileInclude>,
+    pub(crate) build_folder: Option<String>,
     pub(crate) envsetup: Option<config::SdkTarget>,
     pub(crate) test: Option<config::SdkTarget>,
 }
@@ -1309,16 +1548,16 @@ impl config::SdkConfigCore for FilteredSdkConfig {
         &self.gits
     }
 
-    fn mirror(&self) -> &PathBuf {
-        &self.mirror
-    }
-
     fn install(&self) -> &Option<Vec<config::InstallConfig>> {
         &None
     }
 
-    fn makefile_include(&self) -> &Option<Vec<String>> {
-        &self.makefile_include
+    fn makefile_include(&self) -> Option<&config::MakefileInclude> {
+        self.makefile_include.as_ref()
+    }
+
+    fn build_folder(&self) -> &Option<String> {
+        &self.build_folder
     }
 
     fn envsetup(&self) -> &Option<config::SdkTarget> {
@@ -1343,6 +1582,22 @@ impl config::SdkConfigCore for FilteredSdkConfig {
 
     fn variables(&self) -> &Option<std::collections::HashMap<String, String>> {
         &None
+    }
+
+    fn phases(&self) -> Vec<String> {
+        config::default_phases()
+    }
+
+    fn phase_target(&self, phase: &str) -> Option<&config::SdkTarget> {
+        match phase {
+            "envsetup" => self.envsetup.as_ref(),
+            "test" => self.test.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn direnv(&self) -> Option<&config::DirenvConfig> {
+        None
     }
 }
 
@@ -1396,19 +1651,220 @@ pub(crate) fn filter_git_configs(
     }
 }
 
+/// Name of the implicit group a repository belongs to when it has no
+/// explicit `group:` entries set in sdk.yml.
+pub(crate) const DEFAULT_GROUP: &str = "default";
+
+/// Split a comma-separated `--include-group`/`--exclude-group` value into a
+/// trimmed, non-empty list of group names.
+pub(crate) fn parse_group_list(pattern: &str) -> Vec<String> {
+    pattern
+        .split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect()
+}
+
+/// Filter git configurations by group membership.
+///
+/// A repository with no `group:` set implicitly belongs to the "default"
+/// group. When `include` is non-empty, only repositories whose group set
+/// intersects `include` are kept. Repositories whose group set intersects
+/// `exclude` are then dropped. Both lists empty is a no-op.
+pub(crate) fn filter_git_configs_by_group(
+    gits: &[config::GitConfig],
+    include: &[String],
+    exclude: &[String],
+) -> Vec<config::GitConfig> {
+    if include.is_empty() && exclude.is_empty() {
+        return gits.to_vec();
+    }
+
+    fn groups_of(git_cfg: &config::GitConfig) -> Vec<&str> {
+        match &git_cfg.group {
+            Some(groups) if !groups.is_empty() => groups.iter().map(|g| g.as_str()).collect(),
+            _ => vec![DEFAULT_GROUP],
+        }
+    }
+
+    let filtered: Vec<_> = gits
+        .iter()
+        .filter(|git_cfg| {
+            let groups = groups_of(git_cfg);
+            let included =
+                include.is_empty() || groups.iter().any(|g| include.iter().any(|i| i == g));
+            let excluded = groups.iter().any(|g| exclude.iter().any(|e| e == g));
+            included && !excluded
+        })
+        .cloned()
+        .collect();
+
+    if filtered.len() != gits.len() {
+        messages::status(&format!(
+            "Filtered {} repositories out of {} total by group:",
+            filtered.len(),
+            gits.len()
+        ));
+        for git_cfg in &filtered {
+            messages::status(&format!("  - {}", git_cfg.name));
+        }
+    }
+
+    filtered
+}
+
+/// Prune install steps whose `depends_on_gits` references a git that isn't
+/// in `available_gits` (all-of semantics: any missing name prunes the
+/// step), then cascade that removal through `depends_on` chains: any
+/// surviving install step that depends on a pruned one is pruned too,
+/// repeated to a fixed point so multi-level chains (C -> B -> A) are fully
+/// resolved. Steps with `depends_on_gits: None` always survive the first
+/// pass. Used to keep `install-all` (and its per-target Makefile rules)
+/// consistent with whichever gits survived group/pattern filtering and
+/// overlay resolution, regardless of which mechanism removed them.
+pub(crate) fn filter_install_configs_by_gits(
+    installs: &[config::InstallConfig],
+    available_gits: &std::collections::HashSet<&str>,
+) -> Vec<config::InstallConfig> {
+    let mut survivors: Vec<config::InstallConfig> = installs
+        .iter()
+        .filter(|install| match &install.depends_on_gits {
+            Some(gits) => gits.iter().all(|g| available_gits.contains(g.as_str())),
+            None => true,
+        })
+        .cloned()
+        .collect();
+
+    loop {
+        let surviving_names: std::collections::HashSet<String> =
+            survivors.iter().map(|i| i.name.clone()).collect();
+        let before = survivors.len();
+        survivors.retain(|install| match &install.depends_on {
+            Some(deps) => deps.iter().all(|d| surviving_names.contains(d)),
+            None => true,
+        });
+        if survivors.len() == before {
+            break;
+        }
+    }
+
+    if survivors.len() != installs.len() {
+        let survivor_names: std::collections::HashSet<&str> =
+            survivors.iter().map(|i| i.name.as_str()).collect();
+        messages::status(&format!(
+            "Pruned {} install step(s) out of {} total (missing git dependency or cascade):",
+            installs.len() - survivors.len(),
+            installs.len()
+        ));
+        for install in installs {
+            if !survivor_names.contains(install.name.as_str()) {
+                messages::status(&format!("  - {}", install.name));
+            }
+        }
+    }
+
+    survivors
+}
+
 /// Create a filtered SDK config for operations
 pub(crate) fn create_filtered_sdk_config<T: config::SdkConfigCore>(
     sdk_config: &T,
     pattern_regex: &Option<Regex>,
+    include_groups: &[String],
+    exclude_groups: &[String],
 ) -> FilteredSdkConfig {
-    let filtered_gits = filter_git_configs(sdk_config.gits(), pattern_regex);
+    let group_filtered_gits =
+        filter_git_configs_by_group(sdk_config.gits(), include_groups, exclude_groups);
+    let filtered_gits = filter_git_configs(&group_filtered_gits, pattern_regex);
     FilteredSdkConfig {
         gits: filtered_gits,
-        mirror: sdk_config.mirror().to_path_buf(),
-        makefile_include: sdk_config.makefile_include().clone(),
+        makefile_include: sdk_config.makefile_include().cloned(),
+        build_folder: sdk_config.build_folder().clone(),
         envsetup: sdk_config.envsetup().clone(),
         test: sdk_config.test().clone(),
     }
+}
+
+/// Drop `install-<name>` entries from a phase target's `depends_on` list
+/// when `<name>` is no longer a surviving install step. Unlike install-to-
+/// install pruning, phase targets (`sdk-envsetup`, `sdk-build`, ...) are
+/// never removed themselves -- only the dangling reference is stripped, so
+/// `make sdk-envsetup` never fails with "No rule to make target".
+fn strip_removed_install_refs_from_target(
+    target: &mut Option<config::SdkTarget>,
+    removed_install_refs: &std::collections::HashSet<String>,
+) {
+    if let Some(config::SdkTarget::CommandsWithDeps {
+        depends_on: Some(deps),
+        ..
+    }) = target
+    {
+        deps.retain(|d| !removed_install_refs.contains(d));
+    }
+}
+
+/// Filter a full `SdkConfig`'s `gits` list by match pattern/group selection while
+/// keeping every other section (install, build, clean, flash, variables, direnv,
+/// ...) intact. Unlike `create_filtered_sdk_config`/`FilteredSdkConfig` (which only
+/// carries enough fields to drive git cloning), this is safe to pass into
+/// `generate_makefile_content` without silently dropping Makefile sections.
+///
+/// Also prunes `install:` steps whose `depends_on_gits` names a git that
+/// didn't survive filtering (cascading through `depends_on` chains, see
+/// `filter_install_configs_by_gits`), and strips any now-dangling
+/// `install-<name>` reference left behind in `envsetup`/`build`/`test`/
+/// `clean`/`flash`'s `depends_on` or in a git's `build_depends_on` -- those
+/// targets are never removed themselves, so a dangling reference there
+/// would otherwise break `make` with "No rule to make target".
+pub(crate) fn filtered_sdk_config_for_makefile(
+    sdk_config: &config::SdkConfig,
+    pattern_regex: &Option<Regex>,
+    include_groups: &[String],
+    exclude_groups: &[String],
+) -> config::SdkConfig {
+    let mut filtered = sdk_config.clone();
+    let group_filtered_gits =
+        filter_git_configs_by_group(&sdk_config.gits, include_groups, exclude_groups);
+    filtered.gits = filter_git_configs(&group_filtered_gits, pattern_regex);
+
+    let git_names: std::collections::HashSet<&str> =
+        filtered.gits.iter().map(|g| g.name.as_str()).collect();
+    let installs_before = sdk_config.install.clone().unwrap_or_default();
+    filtered.install = filtered
+        .install
+        .map(|installs| filter_install_configs_by_gits(&installs, &git_names));
+
+    let surviving_install_refs: std::collections::HashSet<String> = filtered
+        .install
+        .as_ref()
+        .map(|installs| {
+            installs
+                .iter()
+                .map(|i| format!("install-{}", i.name))
+                .collect()
+        })
+        .unwrap_or_default();
+    let removed_install_refs: std::collections::HashSet<String> = installs_before
+        .iter()
+        .map(|i| format!("install-{}", i.name))
+        .filter(|r| !surviving_install_refs.contains(r))
+        .collect();
+
+    if !removed_install_refs.is_empty() {
+        strip_removed_install_refs_from_target(&mut filtered.envsetup, &removed_install_refs);
+        strip_removed_install_refs_from_target(&mut filtered.build, &removed_install_refs);
+        strip_removed_install_refs_from_target(&mut filtered.test, &removed_install_refs);
+        strip_removed_install_refs_from_target(&mut filtered.clean, &removed_install_refs);
+        strip_removed_install_refs_from_target(&mut filtered.flash, &removed_install_refs);
+        for git in &mut filtered.gits {
+            if let Some(deps) = &mut git.build_depends_on {
+                deps.retain(|d| !removed_install_refs.contains(d));
+            }
+        }
+    }
+
+    filtered
 }
 
 /// List available targets from either a local directory or git repository
@@ -1438,37 +1894,8 @@ pub(crate) fn list_targets_from_git_repo(git_url: &str) -> Result<Vec<String>, a
         return Err(anyhow::anyhow!("Git clone failed: {}", clone_result.stderr));
     }
 
-    // List targets from the cloned repository
-    let targets_dir = temp_path.join("targets");
-    if !targets_dir.exists() {
-        return Err(anyhow::anyhow!(
-            "No 'targets' directory found in git repository"
-        ));
-    }
-
-    let mut targets = Vec::new();
-    for entry in std::fs::read_dir(&targets_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to read targets directory: {}", e))?
-    {
-        let entry = entry.map_err(|e| anyhow::anyhow!("Failed to read directory entry: {}", e))?;
-
-        if entry
-            .file_type()
-            .map_err(|e| anyhow::anyhow!("Failed to get file type: {}", e))?
-            .is_dir()
-        {
-            let target_name = entry.file_name().to_string_lossy().to_string();
-            let config_path = entry.path().join("sdk.yml");
-
-            // Only include directories that have sdk.yml
-            if config_path.exists() {
-                targets.push(target_name);
-            }
-        }
-    }
-
-    targets.sort();
-    Ok(targets)
+    // Reuse the shared targets directory scanner
+    list_available_targets(temp_path)
 }
 
 /// List available versions for a specific target from git repository
@@ -1483,7 +1910,7 @@ pub(crate) fn list_target_versions(
         let mut versions = Vec::new();
         let target_prefix = format!("{}-", target_name);
 
-        for ref_name in refs {
+        for (_, ref_name) in refs {
             // Extract branch/tag name from refs/heads/ or refs/tags/
             let name = if let Some(branch_name) = ref_name.strip_prefix("refs/heads/") {
                 branch_name
@@ -1547,9 +1974,23 @@ pub(crate) fn get_latest_commit_for_branch(repo_path: &Path, branch_name: &str) 
     git_operations::get_latest_commit_for_branch(repo_path, branch_name)
 }
 
+/// Get the latest commit hash for a branch, checking `preferred_remote` first.
+pub(crate) fn get_latest_commit_for_branch_with_remote(
+    repo_path: &Path,
+    branch_name: &str,
+    preferred_remote: Option<&str>,
+) -> Option<String> {
+    git_operations::get_latest_commit_for_branch_with_remote(
+        repo_path,
+        branch_name,
+        preferred_remote,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dsdk_cli::config::DirenvConfig;
     use dsdk_cli::git_operations;
     use std::fs;
     use tempfile::TempDir;
@@ -1559,6 +2000,42 @@ mod tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let workspace_path = temp_dir.path().to_path_buf();
         (temp_dir, workspace_path)
+    }
+
+    #[test]
+    fn test_setup_direnv_non_symlink_content() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+        let direnv_cfg = DirenvConfig {
+            used: true,
+            venv_path: None,
+        };
+
+        setup_direnv(&workspace_path, &direnv_cfg, false).expect("Failed to write .envrc");
+
+        let envrc =
+            fs::read_to_string(workspace_path.join(".envrc")).expect("Failed to read .envrc");
+        assert!(envrc.contains("if [ ! -d \".venv\" ] ; then"));
+        assert!(envrc.contains("python3 -m venv .venv"));
+        assert!(envrc.contains(". .venv/bin/activate"));
+        assert!(!envrc.contains("readlink"));
+    }
+
+    #[test]
+    fn test_setup_direnv_symlink_content() {
+        let (_temp_dir, workspace_path) = create_test_workspace();
+        let direnv_cfg = DirenvConfig {
+            used: true,
+            venv_path: Some(".venv".to_string()),
+        };
+
+        setup_direnv(&workspace_path, &direnv_cfg, true).expect("Failed to write .envrc");
+
+        let envrc =
+            fs::read_to_string(workspace_path.join(".envrc")).expect("Failed to read .envrc");
+        assert!(envrc.contains("if [ -L \".venv\" ] ; then"));
+        assert!(envrc.contains("readlink \".venv\""));
+        assert!(envrc.contains("python3 -m venv \"$_venv_target\""));
+        assert!(envrc.contains(". .venv/bin/activate"));
     }
 
     // Test cases for the new list-targets command functionality
@@ -1573,13 +2050,19 @@ mod tests {
         // Create valid target directories with sdk.yml
         let target1_dir = targets_dir.join("target1");
         fs::create_dir_all(&target1_dir).expect("Failed to create target1 dir");
-        fs::write(target1_dir.join("sdk.yml"), "mirror: /tmp/mirror\ngits: []")
-            .expect("Failed to write target1 config");
+        fs::write(
+            target1_dir.join(SDK_CONFIG_FILE),
+            "mirror: /tmp/mirror\ngits: []",
+        )
+        .expect("Failed to write target1 config");
 
         let target2_dir = targets_dir.join("target2");
         fs::create_dir_all(&target2_dir).expect("Failed to create target2 dir");
-        fs::write(target2_dir.join("sdk.yml"), "mirror: /tmp/mirror\ngits: []")
-            .expect("Failed to write target2 config");
+        fs::write(
+            target2_dir.join(SDK_CONFIG_FILE),
+            "mirror: /tmp/mirror\ngits: []",
+        )
+        .expect("Failed to write target2 config");
 
         // Create invalid target directory without sdk.yml
         let invalid_dir = targets_dir.join("invalid");
@@ -1639,8 +2122,11 @@ mod tests {
         // Create one valid target
         let valid_target_dir = targets_dir.join("valid-target");
         fs::create_dir_all(&valid_target_dir).expect("Failed to create valid target dir");
-        fs::write(valid_target_dir.join("sdk.yml"), "mirror: /tmp\ngits: []")
-            .expect("Failed to write valid config");
+        fs::write(
+            valid_target_dir.join(SDK_CONFIG_FILE),
+            "mirror: /tmp\ngits: []",
+        )
+        .expect("Failed to write valid config");
 
         // Test with invalid target name - this will fail because we're not using real git
         // but we can test the error handling
@@ -1650,13 +2136,16 @@ mod tests {
             None,
             None,
         );
-        // This should fail since it's not a real git repo, but the error should be about git clone
+        // This should fail since it's not a real git repo, but the error should be about clone
         assert!(result.is_err());
-        let error_msg = format!("{}", result.unwrap_err());
+        let error_msg = format!("{:?}", result.unwrap_err());
         assert!(
-            error_msg.contains("Local git clone failed")
+            error_msg.contains("clone")
+                || error_msg.contains("Clone")
                 || error_msg.contains("Git clone failed")
-                || error_msg.contains("Failed to run git clone")
+                || error_msg.contains("Failed to clone"),
+            "Expected clone-related error, got: {}",
+            error_msg
         );
     }
 
@@ -1703,7 +2192,7 @@ gits:
     url: https://github.com/test/repo.git
     commit: main
 "#;
-        let config_path = target_dir.join("sdk.yml");
+        let config_path = target_dir.join(SDK_CONFIG_FILE);
         fs::write(&config_path, config_content).expect("Failed to write config");
 
         // Test resolve_target_config with valid target name
@@ -1730,7 +2219,7 @@ gits:
     url: https://github.com/test/repo.git
     commit: main
 "#;
-        let config_path = target_dir.join("sdk.yml");
+        let config_path = target_dir.join(SDK_CONFIG_FILE);
         fs::write(&config_path, config_content).expect("Failed to write config");
 
         let result = resolve_target_config("test-target", &workspace_path);
@@ -1766,7 +2255,7 @@ gits:
         // Valid target with sdk.yml
         let valid_dir = targets_dir.join("valid-target");
         fs::create_dir_all(&valid_dir).expect("Failed to create valid dir");
-        fs::write(valid_dir.join("sdk.yml"), "mirror: /tmp\ngits: []")
+        fs::write(valid_dir.join(SDK_CONFIG_FILE), "mirror: /tmp\ngits: []")
             .expect("Failed to write valid config");
 
         // Directory without sdk.yml
@@ -1779,7 +2268,7 @@ gits:
         // Hidden directory (should be ignored)
         let hidden_dir = targets_dir.join(".hidden");
         fs::create_dir_all(&hidden_dir).expect("Failed to create hidden dir");
-        fs::write(hidden_dir.join("sdk.yml"), "mirror: /tmp\ngits: []")
+        fs::write(hidden_dir.join(SDK_CONFIG_FILE), "mirror: /tmp\ngits: []")
             .expect("Failed to write hidden config");
 
         let result = list_available_targets(&workspace_path);
@@ -2027,6 +2516,204 @@ gits:
         assert_eq!(workspace_name, target);
     }
 
+    // ---------------------------------------------------------------
+    // filter_install_configs_by_gits tests
+    // ---------------------------------------------------------------
+
+    fn install_step(
+        name: &str,
+        depends_on: Option<Vec<&str>>,
+        depends_on_gits: Option<Vec<&str>>,
+    ) -> config::InstallConfig {
+        config::InstallConfig {
+            name: name.to_string(),
+            depends_on: depends_on.map(|v| v.into_iter().map(String::from).collect()),
+            sentinel: None,
+            commands: None,
+            depends_on_gits: depends_on_gits.map(|v| v.into_iter().map(String::from).collect()),
+        }
+    }
+
+    #[test]
+    fn test_filter_install_configs_by_gits_keeps_generic_step() {
+        let available: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let installs = vec![install_step("standalone-tool", None, None)];
+
+        let result = super::filter_install_configs_by_gits(&installs, &available);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "standalone-tool");
+    }
+
+    #[test]
+    fn test_filter_install_configs_by_gits_keeps_step_when_all_gits_present() {
+        let available: std::collections::HashSet<&str> = ["zephyr", "other-repo"].into();
+        let installs = vec![install_step(
+            "zephyr-python-deps",
+            None,
+            Some(vec!["zephyr"]),
+        )];
+
+        let result = super::filter_install_configs_by_gits(&installs, &available);
+
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_install_configs_by_gits_prunes_step_when_a_git_is_missing() {
+        let available: std::collections::HashSet<&str> = ["other-repo"].into();
+        let installs = vec![install_step(
+            "zephyr-python-deps",
+            None,
+            Some(vec!["zephyr"]),
+        )];
+
+        let result = super::filter_install_configs_by_gits(&installs, &available);
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_install_configs_by_gits_all_of_semantics() {
+        // Even though "other-repo" is present, "zephyr" is missing -- the step
+        // needs all of its named gits, so it's pruned.
+        let available: std::collections::HashSet<&str> = ["other-repo"].into();
+        let installs = vec![install_step(
+            "multi-repo-step",
+            None,
+            Some(vec!["zephyr", "other-repo"]),
+        )];
+
+        let result = super::filter_install_configs_by_gits(&installs, &available);
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_install_configs_by_gits_cascades_single_level() {
+        let available: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let installs = vec![
+            install_step("a", None, Some(vec!["missing-git"])),
+            install_step("b", Some(vec!["a"]), None),
+        ];
+
+        let result = super::filter_install_configs_by_gits(&installs, &available);
+
+        assert!(result.is_empty(), "expected both a and b to be pruned");
+    }
+
+    #[test]
+    fn test_filter_install_configs_by_gits_cascades_multiple_levels() {
+        let available: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let installs = vec![
+            install_step("a", None, Some(vec!["missing-git"])),
+            install_step("b", Some(vec!["a"]), None),
+            install_step("c", Some(vec!["b"]), None),
+            install_step("unrelated", None, None),
+        ];
+
+        let result = super::filter_install_configs_by_gits(&installs, &available);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "unrelated");
+    }
+
+    fn git_config(name: &str, group: Option<Vec<&str>>) -> config::GitConfig {
+        config::GitConfig {
+            name: name.to_string(),
+            url: format!("https://example.com/{}.git", name),
+            commit: "main".to_string(),
+            group: group.map(|v| v.into_iter().map(String::from).collect()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_filtered_sdk_config_for_makefile_strips_dangling_phase_depends_on() {
+        // envsetup depends on an install step tied to a git that gets
+        // excluded -- the install step is pruned, and the dangling
+        // "install-zephyr-python-deps" reference must be stripped from
+        // envsetup's own depends_on so `make sdk-envsetup` doesn't fail
+        // with "No rule to make target".
+        let mut sdk_config = config::SdkConfig {
+            gits: vec![
+                git_config("zephyr", Some(vec!["zephyr"])),
+                git_config("other-repo", None),
+            ],
+            install: Some(vec![
+                install_step("zephyr-python-deps", None, Some(vec!["zephyr"])),
+                install_step("standalone-tool", None, None),
+            ]),
+            ..Default::default()
+        };
+        sdk_config.envsetup = Some(config::SdkTarget::CommandsWithDeps {
+            commands: vec![],
+            depends_on: Some(vec![
+                "install-zephyr-python-deps".to_string(),
+                "install-standalone-tool".to_string(),
+                "other-repo".to_string(),
+            ]),
+        });
+
+        let filtered =
+            filtered_sdk_config_for_makefile(&sdk_config, &None, &[], &["zephyr".to_string()]);
+
+        let install_names: Vec<&str> = filtered
+            .install
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(install_names, vec!["standalone-tool"]);
+
+        let envsetup_deps = filtered.envsetup.unwrap().depends_on().unwrap().to_vec();
+        assert_eq!(
+            envsetup_deps,
+            vec![
+                "install-standalone-tool".to_string(),
+                "other-repo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filtered_sdk_config_for_makefile_strips_dangling_build_depends_on() {
+        let mut sdk_config = config::SdkConfig {
+            gits: vec![
+                git_config("zephyr", Some(vec!["zephyr"])),
+                git_config("other-repo", None),
+            ],
+            install: Some(vec![install_step(
+                "zephyr-python-deps",
+                None,
+                Some(vec!["zephyr"]),
+            )]),
+            ..Default::default()
+        };
+        sdk_config.gits[1].build_depends_on = Some(vec![
+            "install-zephyr-python-deps".to_string(),
+            "zephyr".to_string(),
+        ]);
+
+        let filtered =
+            filtered_sdk_config_for_makefile(&sdk_config, &None, &[], &["zephyr".to_string()]);
+
+        let other_repo = filtered
+            .gits
+            .iter()
+            .find(|g| g.name == "other-repo")
+            .unwrap();
+        assert_eq!(
+            other_repo.build_depends_on,
+            Some(vec!["zephyr".to_string()]),
+            "dangling install-zephyr-python-deps reference should be stripped, \
+             but the (now also gone) zephyr git name is left untouched -- \
+             build_depends_on validation runs pre-filter, this only guards \
+             the install-side dangling reference"
+        );
+    }
+
     #[test]
     fn test_compile_match_regex_single_pattern() {
         let regex = super::compile_match_regex("lwip").unwrap();
@@ -2056,5 +2743,301 @@ gits:
         let regex = super::compile_match_regex("lwip|adi").unwrap();
         assert!(regex.is_match("lwip"));
         assert!(regex.is_match("adi-sdk"));
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_extends_chain_from_source tests (local, non-git sources)
+    // ---------------------------------------------------------------
+
+    /// Create a `targets/<name>/sdk.yml` file under `root`. When
+    /// `overlay_yml` is `Some`, its content is nested under sdk.yml's own
+    /// `overlay:` key (indented), rather than written to a separate file.
+    fn write_target(root: &Path, name: &str, sdk_yml: &str, overlay_yml: Option<&str>) {
+        let dir = root.join("targets").join(name);
+        fs::create_dir_all(&dir).expect("Failed to create target dir");
+        let mut content = sdk_yml.to_string();
+        if let Some(overlay) = overlay_yml {
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str("overlay:\n");
+            for line in overlay.lines() {
+                content.push_str("  ");
+                content.push_str(line);
+                content.push('\n');
+            }
+        }
+        fs::write(dir.join(SDK_CONFIG_FILE), content).expect("Failed to write sdk.yml");
+    }
+
+    #[test]
+    fn test_resolve_extends_chain_non_extends_target_is_passthrough() {
+        let (_temp_dir, root) = create_test_workspace();
+        write_target(
+            &root,
+            "plain-target",
+            "gits:\n  - name: a\n    url: https://example.com/a.git\n    commit: main\n",
+            None,
+        );
+
+        let config_path = resolve_target_config("plain-target", &root).expect("should resolve");
+        let sources = vec![root.to_string_lossy().to_string()];
+        let resolution = resolve_extends_chain_from_source(&config_path, "plain-target", &sources)
+            .expect("should resolve non-extends target");
+
+        assert_eq!(resolution.merged.gits.len(), 1);
+        assert_eq!(resolution.files_to_copy.len(), 1);
+        assert_eq!(resolution.files_to_copy[0].dest_name, SDK_CONFIG_FILE);
+    }
+
+    #[test]
+    fn test_resolve_extends_chain_two_level_merges_and_names_files() {
+        let (_temp_dir, root) = create_test_workspace();
+        write_target(
+            &root,
+            "platform-sdk",
+            "gits:\n  \
+             - name: zephyr\n    url: https://example.com/zephyr.git\n    commit: v4.4.0\n  \
+             - name: mcuboot\n    url: https://example.com/mcuboot.git\n    commit: main\n",
+            None,
+        );
+        write_target(
+            &root,
+            "drone-target",
+            "gits:\n  \
+             - name: drone-camera\n    url: https://example.com/camera.git\n    commit: main\n\
+             extends: platform-sdk\n",
+            Some(
+                "gits:\n  \
+                 remove:\n    - mcuboot\n  \
+                 modify:\n    - name: zephyr\n      commit: v4.5.0\n",
+            ),
+        );
+
+        let config_path = resolve_target_config("drone-target", &root).expect("should resolve");
+        let sources = vec![root.to_string_lossy().to_string()];
+        let resolution = resolve_extends_chain_from_source(&config_path, "drone-target", &sources)
+            .expect("should resolve extends chain");
+
+        let names: Vec<&str> = resolution
+            .merged
+            .gits
+            .iter()
+            .map(|g| g.name.as_str())
+            .collect();
+        assert!(names.contains(&"zephyr"));
+        assert!(names.contains(&"drone-camera"));
+        assert!(!names.contains(&"mcuboot"));
+        let zephyr = resolution
+            .merged
+            .gits
+            .iter()
+            .find(|g| g.name == "zephyr")
+            .unwrap();
+        assert_eq!(zephyr.commit, "v4.5.0");
+
+        // primary target keeps the bare filename at the workspace root; the
+        // ancestor gets a prefixed name under .cim/target-overlays/. There's
+        // only ever one file per level -- the overlay: key lives inside
+        // that same sdk.yml.
+        let dest_names: Vec<&str> = resolution
+            .files_to_copy
+            .iter()
+            .map(|f| f.dest_name.as_str())
+            .collect();
+        assert!(dest_names.contains(&"sdk.yml"));
+        assert!(dest_names.contains(&"platform-sdk-sdk.yml"));
+        assert_eq!(dest_names.len(), 2);
+
+        let primary_subdir = resolution
+            .files_to_copy
+            .iter()
+            .find(|f| f.dest_name == "sdk.yml")
+            .unwrap()
+            .dest_subdir;
+        assert_eq!(primary_subdir, None);
+        let ancestor_subdir = resolution
+            .files_to_copy
+            .iter()
+            .find(|f| f.dest_name == "platform-sdk-sdk.yml")
+            .unwrap()
+            .dest_subdir;
+        assert_eq!(ancestor_subdir, Some(OVERLAYS_DIR));
+    }
+
+    #[test]
+    fn test_resolve_extends_chain_rewrites_ancestor_local_copy_file_sources() {
+        // A base target's local (non-URL, non-absolute) copy_files source
+        // must resolve against the BASE's own directory, not the derived
+        // target's directory -- regression test for a real bug found while
+        // testing the "example"-extending "overlay-example" manifest.
+        let (_temp_dir, root) = create_test_workspace();
+        write_target(
+            &root,
+            "base-sdk",
+            "gits: []\ncopy_files:\n  - source: extra.mk\n    dest: extra.mk\n",
+            None,
+        );
+        // Create the actual local file next to base-sdk's own sdk.yml.
+        fs::write(
+            root.join("targets").join("base-sdk").join("extra.mk"),
+            "# extra makefile fragment\n",
+        )
+        .expect("Failed to write base-sdk/extra.mk");
+
+        write_target(&root, "drone-target", "gits: []\nextends: base-sdk\n", None);
+
+        let config_path = resolve_target_config("drone-target", &root).expect("should resolve");
+        let sources = vec![root.to_string_lossy().to_string()];
+        let resolution = resolve_extends_chain_from_source(&config_path, "drone-target", &sources)
+            .expect("should resolve extends chain");
+
+        let copy_files = resolution
+            .merged
+            .copy_files
+            .expect("copy_files should be inherited from base-sdk");
+        assert_eq!(copy_files.len(), 1);
+        let resolved_source = PathBuf::from(&copy_files[0].source);
+        assert!(
+            resolved_source.is_absolute(),
+            "expected an absolute path, got {}",
+            copy_files[0].source
+        );
+        assert!(
+            resolved_source.exists(),
+            "resolved source {} should point at base-sdk's own extra.mk",
+            resolved_source.display()
+        );
+    }
+
+    #[test]
+    fn test_resolve_extends_chain_tracks_os_and_python_deps_files_per_level() {
+        let (_temp_dir, root) = create_test_workspace();
+
+        // base-sdk has its own os-dependencies.yml and python-dependencies.yml
+        write_target(&root, "base-sdk", "gits: []\n", None);
+        fs::write(
+            root.join("targets").join("base-sdk").join(OS_DEPS_FILE),
+            "linux: {}\n",
+        )
+        .expect("Failed to write base-sdk os-dependencies.yml");
+        fs::write(
+            root.join("targets").join("base-sdk").join(PYTHON_DEPS_FILE),
+            "profiles: {}\ndefault: docs\n",
+        )
+        .expect("Failed to write base-sdk python-dependencies.yml");
+
+        // drone-target has only its own os-dependencies.yml (no python-deps)
+        write_target(&root, "drone-target", "gits: []\nextends: base-sdk\n", None);
+        fs::write(
+            root.join("targets").join("drone-target").join(OS_DEPS_FILE),
+            "linux: {}\n",
+        )
+        .expect("Failed to write drone-target os-dependencies.yml");
+
+        let config_path = resolve_target_config("drone-target", &root).expect("should resolve");
+        let sources = vec![root.to_string_lossy().to_string()];
+        let resolution = resolve_extends_chain_from_source(&config_path, "drone-target", &sources)
+            .expect("should resolve extends chain");
+
+        let dest_names: Vec<&str> = resolution
+            .files_to_copy
+            .iter()
+            .map(|f| f.dest_name.as_str())
+            .collect();
+
+        // Primary's own os-dependencies.yml keeps the bare name at the
+        // workspace root.
+        assert!(dest_names.contains(&"os-dependencies.yml"));
+        // Primary has no python-dependencies.yml of its own.
+        assert!(!dest_names.contains(&"python-dependencies.yml"));
+        // Ancestor's files get the <target>-<file> prefix, destined for
+        // .cim/target-overlays/.
+        assert!(dest_names.contains(&"base-sdk-os-dependencies.yml"));
+        assert!(dest_names.contains(&"base-sdk-python-dependencies.yml"));
+
+        let primary_subdir = resolution
+            .files_to_copy
+            .iter()
+            .find(|f| f.dest_name == "os-dependencies.yml")
+            .unwrap()
+            .dest_subdir;
+        assert_eq!(primary_subdir, None);
+        let ancestor_subdir = resolution
+            .files_to_copy
+            .iter()
+            .find(|f| f.dest_name == "base-sdk-os-dependencies.yml")
+            .unwrap()
+            .dest_subdir;
+        assert_eq!(ancestor_subdir, Some(OVERLAYS_DIR));
+    }
+
+    #[test]
+    fn test_resolve_extends_chain_detects_cycle() {
+        let (_temp_dir, root) = create_test_workspace();
+        write_target(&root, "a-target", "gits: []\nextends: b-target\n", None);
+        write_target(&root, "b-target", "gits: []\nextends: a-target\n", None);
+
+        let config_path = resolve_target_config("a-target", &root).expect("should resolve");
+        let sources = vec![root.to_string_lossy().to_string()];
+        let err =
+            resolve_extends_chain_from_source(&config_path, "a-target", &sources).unwrap_err();
+        assert!(err.contains("cycle"));
+    }
+
+    #[test]
+    fn test_resolve_extends_chain_derived_sdk_yml_own_gits_are_merged() {
+        let (_temp_dir, root) = create_test_workspace();
+        write_target(
+            &root,
+            "base-target",
+            "gits:\n  - name: base-repo\n    url: https://example.com/base.git\n    commit: main\n",
+            None,
+        );
+        write_target(
+            &root,
+            "derived-target",
+            "extends: base-target\ngits:\n  - name: own-repo\n    url: https://example.com/x.git\n    commit: main\n",
+            None,
+        );
+
+        let config_path = resolve_target_config("derived-target", &root).expect("should resolve");
+        let sources = vec![root.to_string_lossy().to_string()];
+        let resolution =
+            resolve_extends_chain_from_source(&config_path, "derived-target", &sources)
+                .expect("own gits should merge with the base's, not error");
+
+        let names: Vec<&str> = resolution
+            .merged
+            .gits
+            .iter()
+            .map(|g| g.name.as_str())
+            .collect();
+        assert!(names.contains(&"base-repo"));
+        assert!(names.contains(&"own-repo"));
+    }
+
+    #[test]
+    fn test_resolve_extends_chain_own_git_colliding_with_base_errors() {
+        let (_temp_dir, root) = create_test_workspace();
+        write_target(
+            &root,
+            "base-target",
+            "gits:\n  - name: shared-repo\n    url: https://example.com/base.git\n    commit: main\n",
+            None,
+        );
+        write_target(
+            &root,
+            "bad-derived",
+            "extends: base-target\ngits:\n  - name: shared-repo\n    url: https://example.com/x.git\n    commit: main\n",
+            None,
+        );
+
+        let config_path = resolve_target_config("bad-derived", &root).expect("should resolve");
+        let sources = vec![root.to_string_lossy().to_string()];
+        let err =
+            resolve_extends_chain_from_source(&config_path, "bad-derived", &sources).unwrap_err();
+        assert!(err.contains("shared-repo"));
+        assert!(err.contains("already exists"));
     }
 }
