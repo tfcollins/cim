@@ -51,6 +51,14 @@ class KernelTests(unittest.TestCase):
         manifest.write_text(json.dumps(data))
         return manifest, path, data
 
+    def test_git_targets_are_self_contained(self):
+        for name in kernel.TARGETS:
+            target = HELPER.parents[1] / ("adi-linux-2023-r2-" + name)
+            self.assertEqual((target / "build-kernel.py").read_bytes(), HELPER.read_bytes())
+            manifest = (target / "sdk.yml").read_text()
+            self.assertIn("source: build-kernel.py", manifest)
+            self.assertNotIn("../", manifest)
+
     def test_both_contracts(self):
         for name in kernel.TARGETS:
             manifest, _, data = self.artifact(name)

@@ -34,7 +34,13 @@ From a checkout of this CIM repository::
 Use ``adi-linux-2023-r2-zynqmp`` for ZynqMP; its default output directory is
 ``artifacts/zynqmp``. ``KERNEL_OUTPUT`` selects another output directory.
 The helper is copied locally via CIM's existing ``copy_files`` support; no
-Rust changes or new CIM CLI commands are required.
+Rust changes or new CIM CLI commands are required. Each target contains an
+identical helper copy because Git-source initialization extracts only the selected
+target directory. The offline tests enforce byte equality with the canonical
+``targets/adi-linux/build-kernel.py``; update all three copies together.
+
+For remote initialization, pass ``--source https://github.com/tfcollins/cim.git``
+and ``--version <reviewed-CIM-commit>`` instead of the local source directory.
 
 Stable standalone helper CLI
 ----------------------------
@@ -126,7 +132,8 @@ manifest as locally usable.
 
 The pyadi-dt integration uses ``ADIDT_KERNEL_ARTIFACTS_ZYNQ`` and
 ``ADIDT_KERNEL_ARTIFACTS_ZYNQMP`` to point to the corresponding manifest.
-It must check schema version, platform, checksum, and provenance before use.
+The consumer minimum checks are schema version, platform, local image path, and
+checksum. Run the helper with ``--verify`` for strict pinned provenance validation.
 
 Cache and concurrency
 ---------------------

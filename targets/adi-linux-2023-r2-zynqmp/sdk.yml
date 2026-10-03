@@ -3,7 +3,7 @@ variables:
   KERNEL_OUTPUT: artifacts/zynqmp
   KERNEL_JOBS: "4"
 copy_files:
-  - source: ../adi-linux/build-kernel.py
+  - source: build-kernel.py
     dest: scripts/build-kernel.py
     cache: false
 build:
