@@ -43,6 +43,9 @@ jobs:
       - name: test
         run: cargo test --all
 
+      - name: ADI kernel helper contracts (offline)
+        run: python3 -m unittest discover -s tests -v
+
   build:
     name: Build (${{ matrix.build }})
     runs-on: ${{ matrix.os }}

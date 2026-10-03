@@ -1,6 +1,9 @@
 Tutorial: Linux Kernel Cross-Compilation
 =========================================
 
+For maintained, checksum-pinned 2023_R2 Zynq/ZynqMP kernel targets, see
+:doc:`adi-linux-2023-r2`. The example below illustrates writing a custom manifest.
+
 This tutorial builds the
 `analogdevicesinc/linux <https://github.com/analogdevicesinc/linux>`_
 kernel with a cross-compilation toolchain. You will learn how to use
@@ -73,7 +76,7 @@ Create ``my-manifests/targets/adi-linux/sdk.yml``:
        clean
 
    flash:
-     - @echo "Copy linux/arch/${{ ARCH }}/boot/Image to your target"
+     - '@echo "Copy linux/arch/${{ ARCH }}/boot/Image to your target"'
 
    gits:
      - name: linux

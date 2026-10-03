@@ -65,6 +65,7 @@ Key Features
 
    tutorials/getting-started
    tutorials/linux-kernel
+   tutorials/adi-linux-2023-r2
    tutorials/fpga-hdl
    tutorials/python-library
 

@@ -10,6 +10,9 @@ sdk.yml
 !/targets/hdl_2023_r2/os-dependencies.yml
 !/targets/hdl_2026_r1/sdk.yml
 !/targets/hdl_2026_r1/os-dependencies.yml
+!/targets/adi-linux-2023-r2-*/sdk.yml
+!/targets/adi-linux-2023-r2-*/os-dependencies.yml
+__pycache__/
 
 # Workspace-generated Makefile (but allow root dev Makefile)
 /**/Makefile
