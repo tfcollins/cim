@@ -1,6 +1,7 @@
 """Fast offline contract/security tests; real kernel builds are separate."""
 import importlib.util
 import io
+import itertools
 import json
 import multiprocessing
 from pathlib import Path
@@ -188,13 +189,13 @@ class KernelTests(unittest.TestCase):
         self.assertEqual((manifest.read_bytes(), image.read_bytes()), before)
 
     def test_build_commands_publication_and_generation_replacement(self):
-        for name in kernel.TARGETS:
-            output = self.root / name
+        for name, release in itertools.product(kernel.TARGETS, kernel.RELEASES):
+            output = self.root / release / name
             commands = []
 
             def extract(_archive, destination):
                 if destination.name == "source":
-                    (destination / ("linux-" + kernel.COMMIT)).mkdir(parents=True)
+                    (destination / ("linux-" + kernel.RELEASES[release]["commit"])).mkdir(parents=True)
                 else:
                     compiler = destination / "bin" / (kernel.TARGETS[name]["triple"] + "-gcc")
                     compiler.parent.mkdir(parents=True)
@@ -209,10 +210,10 @@ class KernelTests(unittest.TestCase):
                 self.assertNotIn("MAKEFLAGS", env)
 
             with patch.object(kernel, "download", return_value=self.root / "archive"), patch.object(kernel, "extract", side_effect=extract), patch.object(kernel, "run", side_effect=run):
-                manifest = kernel.build(name, output, self.root / "cache", 2)
-                first = kernel.validate_manifest(manifest, name)
-                kernel.build(name, output, self.root / "cache", 2, force=True)
-                second = kernel.validate_manifest(manifest, name)
+                manifest = kernel.build(name, output, self.root / "cache", 2, release=release)
+                first = kernel.validate_manifest(manifest, name, release)
+                kernel.build(name, output, self.root / "cache", 2, force=True, release=release)
+                second = kernel.validate_manifest(manifest, name, release)
             self.assertNotEqual(first["kernel_image"], second["kernel_image"])
             self.assertTrue(Path(first["kernel_image"]).is_file())
             self.assertEqual(commands[0][-1], kernel.TARGETS[name]["defconfig"])
