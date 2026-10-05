@@ -105,6 +105,22 @@ class KernelTests(unittest.TestCase):
             self.assertIn(f'--platform "{name}"', text)
             self.assertIn(f'--output "{output}"', text)
             self.assertIn('--jobs "7"', text)
+            # Explicit synthetic cached-image fixtures exercise the real recipe
+            # without pretending to cross-compile a kernel in the offline suite.
+            destination = workspace / output
+            generation = destination / "image-fixture"
+            generation.mkdir(parents=True)
+            image = generation / kernel.TARGETS[name]["output"]
+            payload = self.payload(name)
+            image.write_bytes(kernel.uimage(payload, release) if name == "zynq" else payload)
+            manifest = destination / "artifacts.json"
+            manifest.write_text(json.dumps({"schema_version": 1, "platform": name,
+                "kernel_image": str(image), "sha256": kernel.digest(image),
+                "provenance": kernel.provenance(name, release)}))
+            subprocess.run(["make", "sdk-build", f"KERNEL_RELEASE={release}",
+                            f"KERNEL_PLATFORM={name}", "KERNEL_JOBS=7"], cwd=workspace,
+                           check=True, capture_output=True)
+            kernel.validate_manifest(manifest, name, release)
         self.assertEqual(len(outputs), 4)
         self.assertIn('--output "custom"', recipe("KERNEL_RELEASE=2026_R1", "KERNEL_PLATFORM=zynqmp", "KERNEL_OUTPUT=custom"))
 
