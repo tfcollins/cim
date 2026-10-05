@@ -37,7 +37,7 @@ The helper is copied locally via CIM's existing ``copy_files`` support; no
 Rust changes or new CIM CLI commands are required. Each target contains an
 identical helper copy because Git-source initialization extracts only the selected
 target directory. The offline tests enforce byte equality with the canonical
-``targets/adi-linux/build-kernel.py``; update all three copies together.
+``targets/adi-linux/build-kernel.py``; update the canonical helper and all target-local copies together.
 
 For remote initialization, pass ``--source https://github.com/tfcollins/cim.git``
 and ``--version <reviewed-CIM-commit>`` instead of the local source directory.
@@ -99,6 +99,7 @@ search stale build directories or guess image names. Required top-level fields::
      "kernel_image": "/absolute/output/zynq/image-<generation>/uImage",
      "sha256": "<64 lowercase hexadecimal characters>",
      "provenance": {
+       "release": "2023_R2",
        "source": {
          "url": "<commit archive URL>",
          "sha256": "<archive checksum>",

@@ -24,6 +24,15 @@ SOURCE = {
     "commit": COMMIT, "ref": "2023_R2",
 }
 BASE = "https://mirrors.edge.kernel.org/pub/tools/crosstool/files/bin/x86_64/12.2.0/"
+RELEASES = {
+    "2023_R2": SOURCE,
+    "2026_R1": {
+        "url": "https://codeload.github.com/analogdevicesinc/linux/tar.gz/b47bbbe8ca7bc582c96251fa30d86e55de363f68",
+        "sha256": "0886274c27356de24e3b7030817e1669d1e14b42a17a2c24055d74dad16472ed",
+        "commit": "b47bbbe8ca7bc582c96251fa30d86e55de363f68",
+        "ref": "xlnx_2026.1.0", "ref_type": "tag",
+    },
+}
 TARGETS = {
     "zynq": {"arch": "arm", "defconfig": "zynq_xcomm_adv7511_defconfig",
              "image": "zImage", "output": "uImage", "triple": "arm-linux-gnueabi",
@@ -39,9 +48,9 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def provenance(name):
+def provenance(name, release="2023_R2"):
     target = TARGETS[name]
-    return {"source": SOURCE, "toolchain": {
+    return {"release": release, "source": RELEASES[release], "toolchain": {
         "url": BASE + f"x86_64-gcc-12.2.0-nolibc-{target['triple']}.tar.xz",
         "sha256": target["toolchain_sha256"], "version": "12.2.0",
         "cross_compile": target["triple"] + "-"},
@@ -87,10 +96,10 @@ def extract(archive, destination):
         tar.extractall(destination, filter="data")
 
 
-def uimage(payload):
+def uimage(payload, release="2023_R2"):
     """U-Boot legacy Linux/ARM/kernel/uncompressed header, deterministic time."""
     fields = (0x27051956, 0, 0, len(payload), 0x8000, 0x8000,
-              zlib.crc32(payload), 5, 2, 2, 0, b"ADI Linux 2023_R2")
+              zlib.crc32(payload), 5, 2, 2, 0, ("ADI Linux " + release).encode("ascii"))
     header = struct.pack(">7I4B32s", *fields)
     return header[:4] + struct.pack(">I", zlib.crc32(header)) + header[8:] + payload
 
@@ -112,9 +121,9 @@ def validate_image(path, name):
             raise ValueError("Invalid ARM zImage payload")
 
 
-def validate_manifest(path, name):
+def validate_manifest(path, name, release="2023_R2"):
     data = json.loads(path.read_text())
-    if data["schema_version"] != 1 or data["platform"] != name or data["provenance"] != provenance(name):
+    if data["schema_version"] != 1 or data["platform"] != name or data["provenance"] != provenance(name, release):
         raise ValueError("Artifact provenance mismatch")
     image = Path(data["kernel_image"])
     # Manifest may reference only a generation immediately below its directory.
@@ -131,15 +140,15 @@ def run(command, env):
     subprocess.run(list(map(str, command)), check=True, env=env, stdout=sys.stderr)
 
 
-def build(name, output, cache, jobs, force=False):
+def build(name, output, cache, jobs, force=False, release="2023_R2"):
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     manifest = output / "artifacts.json"
     with lock(output / ".build.lock"):
         if manifest.exists() and not force:
-            validate_manifest(manifest, name)
+            validate_manifest(manifest, name, release)
             return manifest
-        spec = provenance(name)
+        spec = provenance(name, release)
         source_tar = download(spec["source"], cache)
         tools_tar = download(spec["toolchain"], cache)
         # Never trust a mutable extracted source/toolchain cache. Extract verified
@@ -148,7 +157,7 @@ def build(name, output, cache, jobs, force=False):
             work = Path(temporary)
             extract(source_tar, work / "source")
             extract(tools_tar, work / "tools")
-            source = work / "source" / ("linux-" + COMMIT)
+            source = work / "source" / ("linux-" + spec["source"]["commit"])
             compilers = list((work / "tools").rglob(spec["toolchain"]["cross_compile"] + "gcc"))
             if len(compilers) != 1:
                 raise ValueError("Toolchain compiler missing or ambiguous")
@@ -164,7 +173,7 @@ def build(name, output, cache, jobs, force=False):
             run(command + [f"-j{jobs}", target["image"]], env)
             payload = (work / "build" / "arch" / target["arch"] / "boot" / target["image"]).read_bytes()
             staged = work / target["output"]
-            staged.write_bytes(uimage(payload) if name == "zynq" else payload)
+            staged.write_bytes(uimage(payload, release) if name == "zynq" else payload)
             validate_image(staged, name)
             # Immutable generations keep existing readers valid during rebuild.
             generation = Path(tempfile.mkdtemp(prefix="image-", dir=output))
@@ -175,13 +184,14 @@ def build(name, output, cache, jobs, force=False):
             staged_manifest = work / "artifacts.json"
             staged_manifest.write_text(json.dumps(data, indent=2) + "\n")
             os.replace(staged_manifest, manifest)
-        validate_manifest(manifest, name)
+        validate_manifest(manifest, name, release)
     return manifest
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--platform", required=True, choices=TARGETS)
+    parser.add_argument("--release", choices=RELEASES, default="2023_R2")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cache", type=Path, default=Path.home() / ".cache/cim/adi-linux")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
@@ -191,12 +201,12 @@ def main():
     if args.jobs < 1:
         parser.error("--jobs must be positive")
     if args.verify:
-        validate_manifest(args.output.resolve() / "artifacts.json", args.platform)
+        validate_manifest(args.output.resolve() / "artifacts.json", args.platform, args.release)
         print(args.output.resolve() / "artifacts.json")
         return
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         parser.error("Pinned toolchains require Linux x86_64")
-    print(build(args.platform, args.output, args.cache.resolve(), args.jobs, args.force))
+    print(build(args.platform, args.output, args.cache.resolve(), args.jobs, args.force, args.release))
 
 
 if __name__ == "__main__":

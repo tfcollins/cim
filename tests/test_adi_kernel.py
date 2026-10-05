@@ -52,12 +52,39 @@ class KernelTests(unittest.TestCase):
         return manifest, path, data
 
     def test_git_targets_are_self_contained(self):
-        for name in kernel.TARGETS:
-            target = HELPER.parents[1] / ("adi-linux-2023-r2-" + name)
+        for target in HELPER.parents[1].glob("adi-linux-*-*/"):
             self.assertEqual((target / "build-kernel.py").read_bytes(), HELPER.read_bytes())
             manifest = (target / "sdk.yml").read_text()
             self.assertIn("source: build-kernel.py", manifest)
             self.assertNotIn("../", manifest)
+
+    def test_release_selection_and_cache_isolation(self):
+        self.assertEqual(kernel.provenance("zynq"), kernel.provenance("zynq", "2023_R2"))
+        for name in kernel.TARGETS:
+            manifest, image, data = self.artifact(name)
+            with self.assertRaisesRegex(ValueError, "provenance"):
+                kernel.validate_manifest(manifest, name, "2026_R1")
+            data["provenance"] = kernel.provenance(name, "2026_R1")
+            manifest.write_text(json.dumps(data))
+            result = subprocess.run(["python3", HELPER, "--platform", name,
+                                     "--release", "2026_R1", "--output", self.root,
+                                     "--verify"], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(data["provenance"]["source"]["ref"], "xlnx_2026.1.0")
+            self.assertEqual(data["provenance"]["source"]["ref_type"], "tag")
+            with patch.object(kernel, "download", side_effect=RuntimeError("must not download")):
+                with self.assertRaisesRegex(ValueError, "provenance"):
+                    kernel.build(name, self.root, self.root / "cache", 1)
+        self.assertIn(b"ADI Linux 2026_R1", kernel.uimage(self.payload("zynq"), "2026_R1")[:64])
+
+    def test_new_target_recipes_select_release(self):
+        for name in kernel.TARGETS:
+            text = (HELPER.parents[1] / f"adi-linux-2026-r1-{name}/sdk.yml").read_text()
+            self.assertIn("--release 2026_R1", text)
+            self.assertIn(f"artifacts/2026_R1/{name}", text)
+        result = subprocess.run(["python3", HELPER, "--platform", "zynq", "--release",
+                                 "xlnx_2026.1.0", "--output", self.root], capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
 
     def test_both_contracts(self):
         for name in kernel.TARGETS:
