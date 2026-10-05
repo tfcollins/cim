@@ -1,11 +1,11 @@
-Maintained ADI Linux 2023_R2 targets
+ADI Linux target: selectable releases
 ========================================
 
-Targets ``adi-linux-2023-r2-zynq`` and ``adi-linux-2023-r2-zynqmp`` build
-kernel images for pyadi-dt without pyadi-build. These are kernel-only targets:
+The self-contained ``adi-linux`` target builds kernel images for pyadi-dt
+without pyadi-build. It selects releases and platforms at make time and is kernel-only:
 no DTBs, modules installation, root filesystem, BOOT.BIN, flashing, or board
 reservation. Boot/hardware validation remains the consumer's responsibility.
-These targets build ordinary kernels only; device-tree overlays are maintained
+This target builds ordinary kernels only; device-tree overlays are maintained
 separately and are not generated or modified here. Upstream defconfigs and their
 complete embedded radio firmware selections are preserved without pruning.
 
@@ -23,21 +23,30 @@ Build with CIM
 
 From a checkout of this CIM repository::
 
-   cim init --target adi-linux-2023-r2-zynq --source "$PWD" \
+   cim init --target adi-linux --source "$PWD" \
      --workspace "$HOME/cim-zynq" --yes
    cd "$HOME/cim-zynq"
    cim makefile
    make sdk-build KERNEL_JOBS=4
    python3 scripts/build-kernel.py --platform zynq \
-     --output artifacts/zynq --verify
+     --output artifacts/2023_R2/zynq --verify
 
-Use ``adi-linux-2023-r2-zynqmp`` for ZynqMP; its default output directory is
-``artifacts/zynqmp``. ``KERNEL_OUTPUT`` selects another output directory.
-The helper is copied locally via CIM's existing ``copy_files`` support; no
-Rust changes or new CIM CLI commands are required. Each target contains an
-identical helper copy because Git-source initialization extracts only the selected
-target directory. The offline tests enforce byte equality with the canonical
-``targets/adi-linux/build-kernel.py``; update the canonical helper and all target-local copies together.
+Defaults are ``KERNEL_RELEASE=2023_R2``, ``KERNEL_PLATFORM=zynq``, and
+``KERNEL_JOBS=4``. Select either release (``2023_R2`` or ``2026_R1``) and
+platform (``zynq`` or ``zynqmp``) in the same initialized workspace::
+
+   make sdk-build KERNEL_RELEASE=2026_R1 KERNEL_PLATFORM=zynqmp
+
+``KERNEL_OUTPUT`` defaults to ``artifacts/$(KERNEL_RELEASE)/$(KERNEL_PLATFORM)``.
+Its references are resolved by make, so overrides cannot accidentally reuse the
+other release/platform's default output. An explicit ``KERNEL_OUTPUT=/path``
+is an exact directory override: callers must keep custom paths separate.
+The four former release/platform-specific target names have been removed;
+initialize ``adi-linux`` and select with these variables instead.
+
+The helper and dependency manifest live inside ``targets/adi-linux``. CIM's
+``copy_files`` copies the helper into ``scripts/build-kernel.py`` without sibling
+paths, including when pinned Git-source initialization extracts only this target.
 
 For remote initialization, pass ``--source https://github.com/tfcollins/cim.git``
 and ``--version <reviewed-CIM-commit>`` instead of the local source directory.
@@ -58,7 +67,7 @@ only the absolute ``artifacts.json`` path; command/build logs go to stderr.
 selects the archive cache (default ``~/.cache/cim/adi-linux``). ``--force``
 rebuilds without invalidating a previously published generation on failure.
 Do not use output paths containing spaces: upstream kernel make does not
-support them. Separate output directories are required for each platform.
+support them. Separate output directories are required for each release/platform pair.
 
 Pins and packaging
 ------------------
@@ -162,9 +171,11 @@ Verification
 
 Fast tests (no network)::
 
-   python3 -m unittest discover -s tests -v
+   CIM_BIN=/path/to/cim python3 -m unittest discover -s tests -v
 
-Tests cover both contract variants, build invocation/publication with explicit
+With CIM installed, tests generate a real workspace Makefile and verify all four
+release/platform overrides, default isolation, job count, and custom output.
+Without CIM this integration test is explicitly skipped. Tests also cover both contract variants, build invocation/publication with explicit
 fixtures, archive traversal rejection, cache corruption, checksum/provenance
 failures, legacy image CRC/header parsing, process locking, and old-generation
 retention on failure/rebuild. Where installed, ``mkimage -l`` independently

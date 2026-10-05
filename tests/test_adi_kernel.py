@@ -52,12 +52,12 @@ class KernelTests(unittest.TestCase):
         manifest.write_text(json.dumps(data))
         return manifest, path, data
 
-    def test_git_targets_are_self_contained(self):
-        for target in HELPER.parents[1].glob("adi-linux-*-*/"):
-            self.assertEqual((target / "build-kernel.py").read_bytes(), HELPER.read_bytes())
-            manifest = (target / "sdk.yml").read_text()
-            self.assertIn("source: build-kernel.py", manifest)
-            self.assertNotIn("../", manifest)
+    def test_git_target_is_self_contained(self):
+        self.assertEqual(list(HELPER.parents[1].glob("adi-linux-*-*/")), [])
+        manifest = (HELPER.parent / "sdk.yml").read_text()
+        self.assertIn("source: build-kernel.py", manifest)
+        self.assertNotIn("../", manifest)
+        self.assertTrue((HELPER.parent / "os-dependencies.yml").is_file())
 
     def test_release_selection_and_cache_isolation(self):
         self.assertEqual(kernel.provenance("zynq"), kernel.provenance("zynq", "2023_R2"))
@@ -78,11 +78,37 @@ class KernelTests(unittest.TestCase):
                     kernel.build(name, self.root, self.root / "cache", 1)
         self.assertIn(b"ADI Linux 2026_R1", kernel.uimage(self.payload("zynq"), "2026_R1")[:64])
 
-    def test_new_target_recipes_select_release(self):
-        for name in kernel.TARGETS:
-            text = (HELPER.parents[1] / f"adi-linux-2026-r1-{name}/sdk.yml").read_text()
-            self.assertIn("--release 2026_R1", text)
-            self.assertIn(f"artifacts/2026_R1/{name}", text)
+    def test_generated_make_selection(self):
+        # Real CIM generation + GNU make expansion, not a hand-written Makefile.
+        import os
+        cim = os.environ.get("CIM_BIN") or shutil.which("cim")
+        if not cim:
+            self.skipTest("Set CIM_BIN or install cim for generated-Makefile tests")
+        workspace = self.root / "workspace"
+        subprocess.run([cim, "init", "--target", "adi-linux", "--source",
+                        str(HELPER.parents[2]), "--workspace", str(workspace), "--yes"],
+                       check=True, capture_output=True)
+        subprocess.run([cim, "makefile"], cwd=workspace, check=True, capture_output=True)
+        self.assertEqual((workspace / "scripts/build-kernel.py").read_bytes(), HELPER.read_bytes())
+        def recipe(*args):
+            return subprocess.run(["make", "-n", "sdk-build", *args], cwd=workspace,
+                                  check=True, capture_output=True, text=True).stdout
+        default = recipe()
+        self.assertIn('--release "2023_R2"', default)
+        self.assertIn('--platform "zynq"', default)
+        outputs = set()
+        for release, name in itertools.product(kernel.RELEASES, kernel.TARGETS):
+            text = recipe(f"KERNEL_RELEASE={release}", f"KERNEL_PLATFORM={name}", "KERNEL_JOBS=7")
+            output = f"artifacts/{release}/{name}"
+            outputs.add(output)
+            self.assertIn(f'--release "{release}"', text)
+            self.assertIn(f'--platform "{name}"', text)
+            self.assertIn(f'--output "{output}"', text)
+            self.assertIn('--jobs "7"', text)
+        self.assertEqual(len(outputs), 4)
+        self.assertIn('--output "custom"', recipe("KERNEL_RELEASE=2026_R1", "KERNEL_PLATFORM=zynqmp", "KERNEL_OUTPUT=custom"))
+
+    def test_invalid_release_rejected(self):
         result = subprocess.run(["python3", HELPER, "--platform", "zynq", "--release",
                                  "xlnx_2026.1.0", "--output", self.root], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
