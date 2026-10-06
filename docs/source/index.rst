@@ -78,12 +78,14 @@ Key Features
    howto/manage-toolchains
    howto/manage-dependencies
    howto/use-docker
+   howto/adi-linux-pyadi-dt
 
 .. toctree::
    :maxdepth: 1
    :caption: Reference
 
    reference/cli
+   reference/adi-linux
    reference/manifest
    reference/configuration
 

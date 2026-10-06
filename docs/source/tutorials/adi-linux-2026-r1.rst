@@ -28,6 +28,12 @@ The release selector ``2026_R1`` maps to the **tag** ``xlnx_2026.1.0`` in
 Build and validate
 ------------------
 
+For immutable remote initialization and the guided wizard, start with
+:doc:`adi-linux-2023-r2`. The :doc:`/reference/adi-linux` defines artifacts and
+cache behavior; :doc:`/howto/adi-linux-pyadi-dt` covers automated preparation
+and the public ``ADIDT_CIM_RELEASE=2026-R1`` mapping.
+
+
 From a checkout of this repository, build both platforms in one workspace::
 
    repo="$PWD"

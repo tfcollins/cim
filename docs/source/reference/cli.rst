@@ -30,7 +30,11 @@ Initialize workspace from a target.
    * - ``--workspace``, ``-w``
      - Workspace directory (default: ``$HOME/dsdk-<target>``)
    * - ``--version``, ``-v``
-     - Target version
+     - Target source version (use a full immutable Git commit for pinned init)
+   * - ``--source``
+     - Manifest repository URL or local checkout path
+   * - ``--yes``
+     - Accept initialization prompts noninteractively
    * - ``--match``, ``-m``
      - Only clone repos matching pattern (supports comma-separated values)
    * - ``--install``
@@ -55,6 +59,11 @@ makefile
 --------
 
 Generate Makefile from sdk.yml. Must be run from within a workspace.
+
+The ``adi-linux`` target adds ``guide``, ``list-combos``, ``guide-dry-run``
+and ``guide-help`` alongside ``sdk-build``. These are generated Make targets,
+not CIM subcommands. See :doc:`/tutorials/adi-linux-2023-r2` and
+:doc:`adi-linux` for selection variables and helper options.
 
 .. code-block:: bash
 

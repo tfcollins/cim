@@ -1,7 +1,8 @@
 Tutorial: Linux Kernel Cross-Compilation
 =========================================
 
-For maintained, checksum-pinned 2023_R2 Zynq/ZynqMP kernel targets, see
+For the maintained, checksum-pinned ``adi-linux`` target with selectable
+2023_R2 / 2026_R1 and Zynq / ZynqMP, including guided builds, see
 :doc:`adi-linux-2023-r2`. The example below illustrates writing a custom manifest.
 
 This tutorial builds the
