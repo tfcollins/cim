@@ -51,6 +51,46 @@ paths, including when pinned Git-source initialization extracts only this target
 For remote initialization, pass ``--source https://github.com/tfcollins/cim.git``
 and ``--version <reviewed-CIM-commit>`` instead of the local source directory.
 
+Guided build (like HDL)
+-----------------------
+
+After ``cim makefile``, use the same entry points as the HDL target::
+
+   make guide-help
+   make list-combos
+   make guide
+
+The five-step wizard selects release, platform, positive job count and output
+folder, then prints shell-quoted build and offline verification commands.
+Defaults are ``2023_R2``, ``zynq``, four jobs and
+``artifacts/RELEASE/PLATFORM``. Release ``2026_R1`` selects tag
+``xlnx_2026.1.0``. Enter accepts a default; ``?`` or ``list`` shows choices;
+invalid selections retry. At the final prompt explicitly choose ``build`` or
+``verify``; the default is **no**, not an implicit build. ``q``, ``cancel``,
+Ctrl-C or EOF exits successfully without starting any further command.
+
+Inspect selections without downloads, verification or builds::
+
+   make guide-dry-run
+   python3 scripts/guide-linux.py --dry-run --release 2026_R1 --platform zynqmp --jobs 8
+
+For scripted input use ``--interactive`` (``make guide`` already does this).
+Calling the script without an action on noninteractive stdin prints help and
+exits. Help, list and dry-run never invoke the builder. Direct execution needs
+an explicit action::
+
+   python3 scripts/guide-linux.py --verify --release 2026_R1 --platform zynqmp --output artifacts/2026_R1/zynqmp
+   python3 scripts/guide-linux.py --build --release 2023_R2 --platform zynq --jobs 4
+
+The guide passes arguments directly, not through a shell; paths with spaces are
+quoted in printed commands and preserved when passed to the helper. However,
+upstream kernel make does not support spaces during a fresh build; choose a
+space-free output path for builds. Verification of existing artifacts does not
+run make. The guide does not save selections or change automated
+``make sdk-build`` defaults/overrides. Make variables configure ``sdk-build``;
+use wizard prompts or script flags to configure the guide. All guide files are
+copied from the same self-contained target during pinned Git-source init.
+
 Stable standalone helper CLI
 ----------------------------
 
