@@ -65,6 +65,8 @@ Key Features
 
    tutorials/getting-started
    tutorials/linux-kernel
+   tutorials/adi-linux-2023-r2
+   tutorials/adi-linux-2026-r1
    tutorials/fpga-hdl
    tutorials/python-library
 
@@ -76,12 +78,14 @@ Key Features
    howto/manage-toolchains
    howto/manage-dependencies
    howto/use-docker
+   howto/adi-linux-pyadi-dt
 
 .. toctree::
    :maxdepth: 1
    :caption: Reference
 
    reference/cli
+   reference/adi-linux
    reference/manifest
    reference/configuration
 
