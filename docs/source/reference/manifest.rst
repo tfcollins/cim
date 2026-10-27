@@ -216,23 +216,26 @@ preparation instead:
 
    envsetup:
      commands: |
-       @command -v vivado >/dev/null || { echo "Run: . ./env.sh first"; exit 1; }
+       @test -f ${{ VIVADO_DIR }}/settings64.sh || { echo "Vivado not found in ${{ VIVADO_DIR }}"; exit 1; }
 
    build:
      commands: |
-       $(MAKE) -C hdl/projects/fmcomms2/zed
+       +bash scripts/build-hdl.sh ${{ VIVADO_DIR }} hdl/projects/fmcomms2/zed
      depends_on:
        - sdk-envsetup
 
-When users need a shell environment (for example a vendor tool's settings
-script), ship a script with the target and copy it into the workspace with
-``copy_files``; users source it once per shell before running ``make``:
+When a build needs a shell environment (for example a vendor tool's settings
+script), ship a wrapper script with the target, copy it into the workspace
+with ``copy_files``, and call it from the phase. The wrapper sources the
+settings script and runs the build in the same shell:
 
 .. code-block:: yaml
 
    copy_files:
-     - source: env.sh      # targets/<name>/env.sh in the manifest repository
-       dest: env.sh
+     - source: build-hdl.sh   # targets/<name>/build-hdl.sh in the manifest repository
+       dest: scripts/build-hdl.sh
+
+:doc:`/tutorials/fpga-hdl` shows a complete wrapper.
 
 Pass tool locations that the manifest controls, such as toolchains in the
 workspace, through variables instead (see

@@ -4,8 +4,8 @@ Tutorial: FPGA HDL Designs
 This tutorial builds
 `analogdevicesinc/hdl <https://github.com/analogdevicesinc/hdl>`_
 reference designs with AMD Vivado. You will learn how to integrate external
-vendor tools, guard a build with ``envsetup``, ship a helper script with
-``copy_files``, and select projects with variables.
+vendor tools, ship a build wrapper with ``copy_files``, guard a build with
+``envsetup``, and select projects with variables.
 
 What You Will Build
 -------------------
@@ -14,7 +14,8 @@ A manifest that:
 
 - Uses a Vivado installation that already exists on the host (no
   ``toolchains`` section)
-- Ships an ``env.sh`` script that loads the Vivado environment
+- Ships a wrapper script that loads the Vivado environment and runs the HDL
+  build
 - Builds HDL designs with configurable project and board variables
 
 Vivado must be installed separately. The ``main`` branch of the HDL repository
@@ -39,51 +40,75 @@ Create ``my-manifests/targets/adi-hdl/sdk.yml``:
    variables:
      HDL_PROJECT: fmcomms2
      HDL_BOARD: zed
+     VIVADO_DIR: /tools/Xilinx/2025.1/Vivado
 
    copy_files:
-     - source: env.sh
-       dest: env.sh
+     - source: build-hdl.sh
+       dest: scripts/build-hdl.sh
 
    envsetup:
      commands: |
-       @command -v vivado >/dev/null || { echo "vivado not found, run: . ./env.sh"; exit 1; }
+       @test -f ${{ VIVADO_DIR }}/settings64.sh || { echo "Vivado not found in ${{ VIVADO_DIR }}, set VIVADO_DIR"; exit 1; }
 
    build:
      commands: |
-       env -u MAKELEVEL $(MAKE) -C hdl/projects/${{ HDL_PROJECT }}/${{ HDL_BOARD }}
+       +bash scripts/build-hdl.sh ${{ VIVADO_DIR }} hdl/projects/${{ HDL_PROJECT }}/${{ HDL_BOARD }}
      depends_on:
        - sdk-envsetup
 
    clean:
      commands: |
-       $(MAKE) -C hdl/projects/${{ HDL_PROJECT }}/${{ HDL_BOARD }} clean
+       bash scripts/build-hdl.sh ${{ VIVADO_DIR }} hdl/projects/${{ HDL_PROJECT }}/${{ HDL_BOARD }} clean
 
    gits:
      - name: hdl
        url: https://github.com/analogdevicesinc/hdl.git
        commit: main
 
-The HDL build scripts expect to run as the top-level ``make``: some projects
-(those using the transceiver wizard, such as the JESD204 designs) compute
-directory names differently when nested inside another ``make``. ``env -u
-MAKELEVEL`` starts the HDL build as a top-level ``make``.
+``VIVADO_DIR`` is the directory that contains Vivado's ``settings64.sh``
+(here a Vivado 2025.1 installed under ``/tools/Xilinx``).
+``envsetup`` stops the build early with a clear message when it is wrong.
 
-Step 3: Add the Environment Script
-----------------------------------
+The leading ``+`` marks the build command as recursive, so Make shares its
+job slots with the HDL build: ``make -j8 sdk-build`` builds the HDL IP
+libraries in parallel.
 
-Every command in the generated Makefile runs in its own shell, so the manifest
-cannot load Vivado's ``settings64.sh`` for later commands. Instead, the target
-ships a small script that users source in their shell. Create
-``my-manifests/targets/adi-hdl/env.sh``:
+Step 3: Add the Build Wrapper
+-----------------------------
+
+Every command in the generated Makefile runs in its own shell, so sourcing
+``settings64.sh`` in one command has no effect on the next one. The wrapper
+loads the Vivado environment and runs the HDL build in the same shell. Create
+``my-manifests/targets/adi-hdl/build-hdl.sh``:
 
 .. code-block:: bash
 
-   # Load the Vivado environment. Source this from the workspace root:
-   #   VIVADO_DIR=<vivado-install-dir> . ./env.sh
-   . "${VIVADO_DIR:?set VIVADO_DIR to your Vivado installation directory}/settings64.sh"
+   #!/bin/bash
+   # Build an HDL project with Vivado's environment loaded.
+   # Usage: build-hdl.sh <vivado-install-dir> <project-dir> [make-target...]
+   set -e
+   vivado_dir=$1
+   project_dir=$2
+   shift 2
+   targets=("$@")
+   set --
+   . "$vivado_dir/settings64.sh"
+   # Run the HDL build as a top-level make: keep the -j/jobserver flags of the
+   # workspace make, but drop its variable overrides (HDL_PROJECT=... and so on).
+   MAKEFLAGS=${MAKEFLAGS%%-- *}
+   unset MAKEOVERRIDES MAKELEVEL
+   exec make -C "$project_dir" "${targets[@]}"
 
-``copy_files`` resolves the relative ``source: env.sh`` against the target
-directory and copies the file into the workspace during ``cim init``.
+The HDL build scripts expect to run as the top-level ``make``. Nested inside
+the workspace ``make``, some projects (those using the transceiver wizard,
+such as the JESD204 designs) compute directory names differently, and
+variables set on the workspace ``make`` command line would reach the HDL build
+as extra build parameters. The wrapper removes both before it starts the HDL
+build. ``set --`` clears the script arguments so that ``settings64.sh`` does
+not see them.
+
+``copy_files`` resolves the relative ``source: build-hdl.sh`` against the
+target directory and copies the file into the workspace during ``cim init``.
 
 Step 4: Initialize and Build
 ----------------------------
@@ -92,32 +117,27 @@ Step 4: Initialize and Build
 
    cim init --target adi-hdl --source ./my-manifests --install
    cd ~/dsdk-adi-hdl
-   VIVADO_DIR=<vivado-install-dir> . ./env.sh
-   make sdk-build
+   make -j8 sdk-build
 
-Replace ``<vivado-install-dir>`` with the directory that contains Vivado's
-``settings64.sh``. To target a different board without editing the manifest,
-set the variables in the environment:
+If Vivado is installed elsewhere, or to target a different board without
+editing the manifest, set the variables on the command line:
 
 .. code-block:: bash
 
-   HDL_PROJECT=ad9081_fmca_ebz HDL_BOARD=zcu102 make sdk-build
-
-Do not pass them as ``make`` arguments (``make HDL_PROJECT=... sdk-build``).
-Make forwards command-line variables to every sub-make, and the HDL build
-scripts treat each one as a build parameter: they create a separate project
-variant named after it and the build fails.
+   make -j8 VIVADO_DIR=/opt/Xilinx/2025.1/Vivado sdk-build
+   make -j8 HDL_PROJECT=ad9081_fmca_ebz HDL_BOARD=zcu102 sdk-build
 
 What You Learned
 ----------------
 
 - **External vendor tools.** Vivado and Quartus are large tools installed
-  separately. The workspace provides a script to load their environment, and
-  ``envsetup`` fails early with a clear message when it has not been loaded.
+  separately. A wrapper script loads their environment and runs the build in
+  one shell, so users do not need to set up their shell first.
 - **Explicit dependencies.** ``depends_on: [sdk-envsetup]`` makes
-  ``make sdk-build`` run the check first.
+  ``make sdk-build`` check for Vivado first.
 - **copy_files for helper files.** Scripts and other files in the manifest
   repository can be copied into every workspace; remote files can be
   downloaded and cached in the mirror the same way.
-- **Variables for project selection.** ``HDL_PROJECT`` and ``HDL_BOARD`` let
-  users target different boards at build time without editing the manifest.
+- **Variables for project selection.** ``HDL_PROJECT``, ``HDL_BOARD`` and
+  ``VIVADO_DIR`` let users target different boards and Vivado installations
+  at build time without editing the manifest.
