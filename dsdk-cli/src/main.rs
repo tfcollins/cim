@@ -12,6 +12,7 @@
 mod bootstrap_cmd;
 mod cli;
 mod init_cmd;
+mod inspect_cmd;
 mod install_cmd;
 mod makefile;
 mod release_cmd;
@@ -28,6 +29,7 @@ use init_cmd::{
     handle_add_command, handle_docs_command, handle_foreach_command, handle_init_command,
     InitConfig,
 };
+use inspect_cmd::{handle_inspect_command, InspectConfig};
 use install_cmd::handle_install_command;
 use makefile::handle_makefile_command;
 use release_cmd::handle_release_command;
@@ -64,9 +66,28 @@ fn main() {
             target,
             verbose,
             format,
+            detail,
         } => {
             messages::set_verbose(*verbose);
-            handle_list_targets_command(source.as_deref(), target.as_deref(), format);
+            handle_list_targets_command(source.as_deref(), target.as_deref(), format, *detail);
+        }
+        Commands::Inspect {
+            target,
+            target_flag,
+            source,
+            version,
+            format,
+            verbose,
+        } => {
+            messages::set_verbose(*verbose);
+            let effective_target = target_flag.clone().or_else(|| target.clone());
+            handle_inspect_command(InspectConfig {
+                target: effective_target,
+                source: source.clone(),
+                version: version.clone(),
+                format: format.clone(),
+                verbose: *verbose,
+            });
         }
         Commands::Init {
             target,

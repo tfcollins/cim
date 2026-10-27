@@ -12,11 +12,79 @@ Show available targets from a manifest repository.
 .. code-block:: bash
 
    cim list-targets [--source URL|PATH] [--target NAME] [--verbose]
-                    [--format text|json]
+                    [--format text|json] [--detail]
+
+Pass ``--detail`` to include target descriptions and inheritance metadata (such as
+which target it ``extends:``).
 
 With ``--target``, lists the versions of that target: the branches and tags of
 the manifest repository whose names start with ``<target>-``. Pass the full
 name to ``cim init --version``.
+
+inspect
+-------
+
+Inspect a target's configuration, resolved inheritance chain, variables, git
+repositories, toolchains, install steps, OS dependencies, and Python dependencies.
+
+When run inside an existing workspace without a target name, inspects the
+current workspace.
+
+.. code-block:: bash
+
+   cim inspect [TARGET] [--target TARGET] [--source URL|PATH]
+               [--version VERSION] [--format text|json] [--verbose]
+
+.. list-table::
+   :header-rows: 1
+
+   * - Option
+     - Description
+   * - ``[TARGET]``, ``--target``, ``-t``
+     - Target name to inspect (optional when inside an initialized workspace)
+   * - ``--source``, ``-s``
+     - Manifest repository: a git URL or local directory
+   * - ``--version``, ``-v``
+     - Target version (branch or tag name)
+   * - ``--format``
+     - Output format: ``text`` (default human-readable summary) or ``json`` (machine-readable)
+   * - ``--verbose``
+     - Enable verbose progress logging
+
+Example text output:
+
+.. code-block:: bash
+
+   $ cim inspect adi-linux --source ~/dev/datax-manifests
+   Target: adi-linux
+   Description: Self-contained, kernel-only target that builds `analogdevicesinc/linux` images
+   Source: /home/tcollins/dev/datax-manifests
+
+   Variables:
+     KERNEL_JOBS = "4"
+     KERNEL_OUTPUT = "artifacts/${{ KERNEL_RELEASE }}/${{ KERNEL_PLATFORM }}"
+     KERNEL_PLATFORM = "zynq"
+     KERNEL_RELEASE = "2023_R2"
+
+   Copy Files:
+     - guide-linux.py -> scripts/guide-linux.py
+     - linux.mk -> linux.mk
+     - build-kernel.py -> scripts/build-kernel.py
+
+   Makefile Includes:
+     - include linux.mk
+
+   Phases: envsetup, build, clean, test, flash, help
+
+   OS Dependencies:
+     linux-x86_64 / ubuntu-24.04 (apt-get install): python3, build-essential, bc, bison, flex, libssl-dev, libelf-dev
+
+Example JSON output (for scripts and AI agents):
+
+.. code-block:: bash
+
+   $ cim inspect hdl-boot --source ~/dev/datax-manifests --format json | jq .extends
+   "hdl"
 
 init
 ----

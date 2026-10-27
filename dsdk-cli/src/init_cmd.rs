@@ -357,6 +357,115 @@ pub(crate) fn resolve_target_config(
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TargetSummary {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extends: Option<String>,
+}
+
+/// Extract target description by checking explicit description field in sdk.yml,
+/// then first non-heading line of README.md, then top comment in sdk.yml.
+pub(crate) fn extract_target_description(
+    target_dir: &Path,
+    sdk_config: Option<&config::SdkConfig>,
+) -> Option<String> {
+    if let Some(sdk) = sdk_config {
+        if let Some(ref desc) = sdk.description {
+            let trimmed = desc.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    let readme_path = target_dir.join("README.md");
+    if readme_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&readme_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty()
+                    || trimmed.starts_with('#')
+                    || trimmed.starts_with("==")
+                    || trimmed.starts_with("--")
+                {
+                    continue;
+                }
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    let sdk_path = target_dir.join(SDK_CONFIG_FILE);
+    if sdk_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&sdk_path) {
+            let mut comments = Vec::new();
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('#') {
+                    let comment = trimmed.trim_start_matches('#').trim();
+                    if !comment.is_empty()
+                        && !comment.to_lowercase().contains("copyright")
+                        && !comment.to_lowercase().contains("license")
+                        && !comment.to_lowercase().contains("spdx")
+                    {
+                        comments.push(comment.to_string());
+                    }
+                } else if !trimmed.is_empty() {
+                    break;
+                }
+            }
+            if !comments.is_empty() {
+                return Some(comments.join(" "));
+            }
+        }
+    }
+
+    None
+}
+
+/// List available targets along with metadata (description, extends)
+pub(crate) fn list_available_target_summaries(
+    config_root: &Path,
+) -> Result<Vec<TargetSummary>, anyhow::Error> {
+    let targets_dir = config_root.join("targets");
+
+    if !targets_dir.exists() {
+        return Err(anyhow::anyhow!(
+            "Targets directory not found: {}",
+            targets_dir.display()
+        ));
+    }
+
+    let mut summaries = Vec::new();
+
+    for entry in std::fs::read_dir(&targets_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let target_name = entry.file_name().to_string_lossy().to_string();
+            let config_path = entry.path().join(SDK_CONFIG_FILE);
+
+            if config_path.exists() {
+                let sdk = config::load_config(&config_path).ok();
+                let extends = sdk
+                    .as_ref()
+                    .and_then(|s| s.extends.as_ref().map(|e| e.target.clone()));
+                let description = extract_target_description(&entry.path(), sdk.as_ref());
+                summaries.push(TargetSummary {
+                    name: target_name,
+                    description,
+                    extends,
+                });
+            }
+        }
+    }
+
+    summaries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(summaries)
+}
+
 /// List available targets by scanning directories
 pub(crate) fn list_available_targets(config_root: &Path) -> Result<Vec<String>, anyhow::Error> {
     let targets_dir = config_root.join("targets");
@@ -2121,6 +2230,35 @@ pub(crate) fn filtered_sdk_config_for_makefile(
     }
 
     filtered
+}
+
+/// List available target summaries from either a local directory or git repository
+pub(crate) fn list_target_summaries_from_source(
+    source_path: &str,
+) -> Result<Vec<TargetSummary>, anyhow::Error> {
+    if is_url(source_path) {
+        list_target_summaries_from_git_repo(source_path)
+    } else {
+        let path = PathBuf::from(source_path);
+        list_available_target_summaries(&path)
+    }
+}
+
+/// List available target summaries from a remote git repository using temporary clone
+pub(crate) fn list_target_summaries_from_git_repo(
+    git_url: &str,
+) -> Result<Vec<TargetSummary>, anyhow::Error> {
+    let temp_dir = tempfile::tempdir()
+        .map_err(|e| anyhow::anyhow!("Failed to create temp directory: {}", e))?;
+
+    let temp_path = temp_dir.path();
+    let clone_result = git_operations::clone_repo_shallow(git_url, temp_path, 1)?;
+
+    if !clone_result.is_success() {
+        return Err(anyhow::anyhow!("Git clone failed: {}", clone_result.stderr));
+    }
+
+    list_available_target_summaries(temp_path)
 }
 
 /// List available targets from either a local directory or git repository

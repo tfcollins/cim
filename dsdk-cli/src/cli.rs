@@ -88,7 +88,7 @@ pub struct WorkspaceSelectionArgs {
 #[command(name = "cim")]
 #[command(disable_version_flag = true)]
 #[command(
-    about = "Code in Motion - Multi-repository workspace manager\n\nWORKFLOW:\n  1. List targets:         cim list-targets [--source DIR|URL]\n  2. Initialize workspace: cim init --target <name> [--source DIR|URL] [-w /path/to/workspace]\n  3. Use from workspace:   cd /path/to/workspace && cim <command>\n\nCONFIG FILES:\n  sdk.yml                   - Main configuration\n  .workspace                - Workspace marker (auto-created)\n  os-dependencies.yml       - System packages\n  python-dependencies.yml   - Python packages"
+    about = "Code in Motion - Multi-repository workspace manager\n\nWORKFLOW:\n  1. List targets:         cim list-targets [--source DIR|URL]\n  2. Inspect target:       cim inspect <name> [--source DIR|URL]\n  3. Initialize workspace: cim init --target <name> [--source DIR|URL] [-w /path/to/workspace]\n  4. Use from workspace:   cd /path/to/workspace && cim <command>\n\nCONFIG FILES:\n  sdk.yml                   - Main configuration\n  .workspace                - Workspace marker (auto-created)\n  os-dependencies.yml       - System packages\n  python-dependencies.yml   - Python packages"
 )]
 pub struct Cli {
     /// Show version information
@@ -130,6 +130,49 @@ pub enum Commands {
             help = "Output format: text (default) or json"
         )]
         format: String,
+        /// Include target descriptions and metadata
+        #[arg(long, help = "Include target descriptions and metadata")]
+        detail: bool,
+    },
+    /// Inspect a target's configuration, dependencies, and variables
+    Inspect {
+        /// Target name to inspect (optional if run inside an existing workspace)
+        #[arg(value_name = "TARGET", help = "Target name to inspect")]
+        target: Option<String>,
+        /// Target name to inspect (flag form)
+        #[arg(
+            short = 't',
+            long = "target",
+            help = "Target name to inspect (flag form)"
+        )]
+        target_flag: Option<String>,
+        /// Source location (git repository URL or local path)
+        #[arg(
+            short,
+            long,
+            value_name = "URL|PATH",
+            help = "Git repository URL or local path to manifests"
+        )]
+        source: Option<String>,
+        /// Target version (branch or tag name)
+        #[arg(
+            short = 'v',
+            long = "version",
+            value_name = "VERSION",
+            help = "Target version (branch/tag name)"
+        )]
+        version: Option<String>,
+        /// Output format
+        #[arg(
+            long,
+            value_name = "FORMAT",
+            default_value = "text",
+            help = "Output format: text (default) or json"
+        )]
+        format: String,
+        /// Show detailed output
+        #[arg(long, help = "Show detailed progress information")]
+        verbose: bool,
     },
     /// Initialize a new workspace from a configuration file
     Init {
@@ -680,17 +723,19 @@ mod tests {
                 target,
                 verbose,
                 format,
+                detail,
             }) => {
                 assert!(source.is_none());
                 assert!(target.is_none());
                 assert!(!verbose);
                 assert_eq!(format, "text");
+                assert!(!detail);
             }
             _ => panic!("Expected ListTargets command"),
         }
 
         // Test list-targets with source
-        let list_args_with_source = vec!["cim", "list-targets", "--source", "/path/to/source"];
+        let list_args_with_source = vec!["cim", "list-targets", "--source", "/path/to/source", "--detail"];
         let cli_result = Cli::try_parse_from(list_args_with_source);
         assert!(cli_result.is_ok());
 
@@ -701,13 +746,38 @@ mod tests {
                 target,
                 verbose,
                 format,
+                detail,
             }) => {
                 assert_eq!(source, &Some("/path/to/source".to_string()));
                 assert!(target.is_none());
                 assert!(!verbose);
                 assert_eq!(format, "text");
+                assert!(detail);
             }
             _ => panic!("Expected ListTargets command"),
+        }
+    }
+
+    #[test]
+    fn test_inspect_cli_parsing() {
+        let args = vec!["cim", "inspect", "adi-linux", "--format", "json"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Some(Commands::Inspect { target, format, .. }) => {
+                assert_eq!(target, Some("adi-linux".to_string()));
+                assert_eq!(format, "json");
+            }
+            _ => panic!("Expected Inspect command"),
+        }
+
+        let args_flag = vec!["cim", "inspect", "-t", "adi-linux", "-s", "/path/to/manifests"];
+        let cli_flag = Cli::try_parse_from(args_flag).unwrap();
+        match cli_flag.command {
+            Some(Commands::Inspect { target_flag, source, .. }) => {
+                assert_eq!(target_flag, Some("adi-linux".to_string()));
+                assert_eq!(source, Some("/path/to/manifests".to_string()));
+            }
+            _ => panic!("Expected Inspect command"),
         }
     }
 

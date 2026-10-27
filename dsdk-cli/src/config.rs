@@ -1006,6 +1006,9 @@ where
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct SdkConfig {
+    /// Optional target description
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default, deserialize_with = "deserialize_gits")]
     pub gits: Vec<GitConfig>,
     #[serde(default)]

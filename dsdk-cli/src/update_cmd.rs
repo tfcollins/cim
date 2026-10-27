@@ -12,8 +12,9 @@
 use crate::cli::{Cli, DockerCommand};
 use crate::init_cmd::{
     compile_match_regex, create_filtered_sdk_config, get_latest_commit_for_branch,
-    get_latest_commit_for_branch_with_remote, is_branch_reference, list_target_versions,
-    list_targets_from_source, parse_group_list, setup_direnv, source_label,
+    get_latest_commit_for_branch_with_remote, is_branch_reference, list_target_summaries_from_source,
+    list_target_versions, list_targets_from_source, parse_group_list, setup_direnv, source_label,
+    TargetSummary,
 };
 use crate::version::{print_update_notice, spawn_version_check};
 use clap::CommandFactory;
@@ -247,6 +248,14 @@ struct JsonSourceTargets {
     targets: Vec<String>,
 }
 
+/// One manifest source and detailed targets it exposes, for `--format json --detail`.
+#[derive(serde::Serialize)]
+struct JsonSourceDetailedTargets {
+    source: String,
+    kind: &'static str,
+    targets: Vec<TargetSummary>,
+}
+
 /// A single target's available versions, for `--format json`.
 #[derive(serde::Serialize)]
 struct JsonTargetVersions {
@@ -260,6 +269,7 @@ pub(crate) fn handle_list_targets_command(
     source: Option<&str>,
     target_filter: Option<&str>,
     format: &str,
+    detail: bool,
 ) {
     let json = format.eq_ignore_ascii_case("json");
 
@@ -295,6 +305,36 @@ pub(crate) fn handle_list_targets_command(
                         "Error listing versions for target '{}': {}",
                         target_name, e
                     ));
+                    std::process::exit(1);
+                }
+            }
+        } else if detail {
+            match list_target_summaries_from_source(&source_path) {
+                Ok(targets) => {
+                    if json {
+                        print_json(&JsonSourceDetailedTargets {
+                            source: source_path,
+                            kind: "default",
+                            targets,
+                        });
+                    } else if targets.is_empty() {
+                        messages::status(&format!("No targets found in {}", source_path));
+                    } else {
+                        messages::status(&format!("Available targets from {}:", source_path));
+                        for target in targets {
+                            let mut line = format!("  - {}", target.name);
+                            if let Some(ref desc) = target.description {
+                                line.push_str(&format!(": {}", desc));
+                            }
+                            if let Some(ref ext) = target.extends {
+                                line.push_str(&format!(" (extends: {})", ext));
+                            }
+                            messages::status(&line);
+                        }
+                    }
+                }
+                Err(e) => {
+                    messages::error(&format!("Error listing targets: {}", e));
                     std::process::exit(1);
                 }
             }
@@ -377,6 +417,68 @@ pub(crate) fn handle_list_targets_command(
             print_json(&json_results);
         } else if !any_versions {
             messages::status(&format!("No versions found for target '{}'", target_name));
+        }
+    } else if detail {
+        let mut any_targets = false;
+        let mut json_results: Vec<JsonSourceDetailedTargets> = Vec::new();
+        for (i, source_path) in sources.iter().enumerate() {
+            match list_target_summaries_from_source(source_path) {
+                Ok(targets) => {
+                    if !targets.is_empty() {
+                        any_targets = true;
+                        if json {
+                            json_results.push(JsonSourceDetailedTargets {
+                                source: source_path.clone(),
+                                kind: source_label(i),
+                                targets,
+                            });
+                        } else if has_alternates {
+                            messages::status(&format!(
+                                "  Source: {} ({})",
+                                source_path,
+                                source_label(i)
+                            ));
+                            for target in targets {
+                                let mut line = format!("    - {}", target.name);
+                                if let Some(ref desc) = target.description {
+                                    line.push_str(&format!(": {}", desc));
+                                }
+                                if let Some(ref ext) = target.extends {
+                                    line.push_str(&format!(" (extends: {})", ext));
+                                }
+                                messages::status(&line);
+                            }
+                        } else {
+                            messages::status(&format!("Available targets from {}:", source_path));
+                            for target in targets {
+                                let mut line = format!("  - {}", target.name);
+                                if let Some(ref desc) = target.description {
+                                    line.push_str(&format!(": {}", desc));
+                                }
+                                if let Some(ref ext) = target.extends {
+                                    line.push_str(&format!(" (extends: {})", ext));
+                                }
+                                messages::status(&line);
+                            }
+                        }
+                    } else if !has_alternates && !json {
+                        messages::status(&format!("No targets found in {}", source_path));
+                    }
+                }
+                Err(e) => {
+                    if has_alternates {
+                        messages::verbose(&format!("  Skipping {} (error: {})", source_path, e));
+                    } else {
+                        messages::error(&format!("Error listing targets: {}", e));
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        if json {
+            print_json(&json_results);
+        } else if !any_targets {
+            messages::status("No targets found in any configured manifest source");
         }
     } else {
         let mut any_targets = false;

@@ -656,6 +656,7 @@ pub fn apply_overlay(
         variables,
         phases: derived.phases.or(base.phases),
         direnv: derived.direnv.or(base.direnv),
+        description: derived.description.or(base.description),
         ..Default::default()
     })
 }
